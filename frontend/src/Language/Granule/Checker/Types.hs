@@ -2,15 +2,55 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE ImplicitParams #-}
+{-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ViewPatterns #-}
 
-module Language.Granule.Checker.Types where
+{-# options_ghc -fno-warn-missing-signatures #-}
+
+module Language.Granule.Checker.Types
+    (
+    -- ** Specification indicators
+      SpecIndicator(..)
+
+    -- ** Equality tests
+    , checkEquality
+
+    , requireEqualTypes
+    , requireEqualTypesRelatedCoeffects
+
+    , typesAreEqual
+    , typesAreEqualWithCheck
+    , lTypesAreEqual
+
+    , equalTypesRelatedCoeffects
+
+    , equalTypes
+    , lEqualTypes
+
+    , equalTypesWithPolarity
+    , lEqualTypesWithPolarity
+
+    , equalTypesWithUniversalSpecialisation
+
+    , joinTypes
+
+    -- *** Instance Equality
+    , equalInstances
+    , instancesAreEqual
+
+    -- *** Kind Equality
+    , equalKinds
+
+    -- *** Effect Equality
+    , twoEqualEffectTypes
+    ) where
 
 import Control.Monad.State.Strict
 
 import Language.Granule.Checker.Constraints.Compile
 
 import Language.Granule.Checker.Effects
+import Language.Granule.Checker.Instance
 import Language.Granule.Checker.Kinds
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.Predicates
@@ -26,25 +66,185 @@ import Language.Granule.Syntax.Type
 
 import Language.Granule.Utils
 
-lEqualTypesWithPolarity :: (?globals :: Globals)
-  => Span -> SpecIndicator ->Type -> Type -> Checker (Bool, Type, Substitution)
-lEqualTypesWithPolarity s pol = equalTypesRelatedCoeffectsAndUnify s ApproximatedBy pol
 
-equalTypesWithPolarity :: (?globals :: Globals)
-  => Span -> SpecIndicator -> Type -> Type -> Checker (Bool, Type, Substitution)
-equalTypesWithPolarity s pol = equalTypesRelatedCoeffectsAndUnify s Eq pol
+------------------------------
+----- Inequality Reasons -----
+------------------------------
 
-lEqualTypes :: (?globals :: Globals)
-  => Span -> Type -> Type -> Checker (Bool, Type, Substitution)
-lEqualTypes s = equalTypesRelatedCoeffectsAndUnify s ApproximatedBy SndIsSpec
+type InequalityReason = CheckerError
 
-equalTypes :: (?globals :: Globals)
-  => Span -> Type -> Type -> Checker (Bool, Type, Substitution)
+
+equalityErr :: InequalityReason -> Checker a
+equalityErr = throw
+
+
+unequalSessionTypes s t1 t2 = equalityErr $
+  TypeError{ errLoc = s, tyExpected = t1, tyActual = t2 }
+
+
+sessionsNotDual s t1 t2 = equalityErr $
+  SessionDualityError{ errLoc = s, errTy1 = t1, errTy2 = t2 }
+
+
+kindEqualityIsUndefined s k1 k2 t1 t2 = equalityErr $
+  UndefinedEqualityKindError{ errLoc = s, errTy1 = t1
+                            , errK1 = k1, errTy2 = t2, errK2 = k2 }
+
+
+contextDoesNotAllowUnification s x y = equalityErr $
+  UnificationDisallowed { errLoc = s, errTy1 = x, errTy2 = y }
+
+
+cannotUnifyUniversalWithConcrete s n kind t = equalityErr $
+  UnificationFail{ errLoc = s, errVar = n, errKind = kind, errTy = t }
+
+
+twoUniversallyQuantifiedVariablesAreUnequal s v1 v2 = equalityErr $
+  CannotUnifyUniversalWithConcrete{ errLoc = s, errVar1 = v1, errVar2 = v2 }
+
+
+nonUnifiable s t1 t2 = equalityErr $
+  UnificationError{ errLoc = s, errTy1 = t1, errTy2 = t2}
+
+
+-- | Attempt to unify a non-type variable with a type.
+illKindedUnifyVar sp (v, k1) (t, k2) = equalityErr $
+   UnificationKindError{ errLoc = sp, errTy1 = TyVar v
+                       , errK1 = k1, errTy2 = t, errK2 = k2 }
+
+
+miscErr :: CheckerError -> Checker EqualityResult
+miscErr = equalityErr
+
+
+--------------------------
+----- Equality types -----
+--------------------------
+
+
+type EqualityResult = (Bool, Substitution)
+
+
+-- | True if the check for equality was successful.
+equalityResultIsSuccess :: (a -> Bool) -> Checker a -> Checker Bool
+equalityResultIsSuccess f c =
+  fmap (either (const False) f . fst) (peekChecker c)
+
+
+-- | If the equality is successful, then act, otherwise report a false equality.
+equalityResultIsSuccessAndAct :: Checker (Bool, a, b) -> Checker Bool
+equalityResultIsSuccessAndAct c = do
+  (res, st) <- peekChecker c
+  case res of
+    Left _ -> pure False
+    Right (True, _, _) -> fmap (const True) st
+    Right (False, _, _) -> pure False
+
+
+-- | A proof of a trivial equality ('x' and 'y' are equal because we say so).
+trivialEquality' :: EqualityResult
+trivialEquality' = (True, [])
+
+
+-- | Equality where nothing needs to be done.
+trivialEquality :: Checker EqualityResult
+trivialEquality = pure trivialEquality'
+
+
+-- | An equality under the given proof.
+equalWith :: ([Constraint], Substitution) -> Checker EqualityResult
+equalWith (cs, s) = do
+  mapM_ addConstraint cs
+  pure (True, s)
+
+
+-- | Check for equality, and update the checker state.
+checkEquality :: (Type -> Checker EqualityResult) -> Type -> Checker EqualityResult
+checkEquality eqm = eqm
+
+
+------------------
+-- Type helpers --
+------------------
+
+
+-- | Explains how coeffects should be related by a solver constraint.
+type Rel = (Span -> Coeffect -> Coeffect -> Type -> Constraint)
+
+
+type EqualityProver a b = (?globals :: Globals) =>
+  Span -> Rel -> SpecIndicator -> a -> a -> Checker b
+
+
+type EqualityProver' a b = (?globals :: Globals) =>
+  Span -> a -> a -> Checker b
+
+
+type EqualityProverWithSpec a b = (?globals :: Globals) =>
+  Span -> SpecIndicator -> a -> a -> Checker b
+
+
+---------------------------------
+----- Bulk of equality code -----
+---------------------------------
+
+
+-- | True if the two types are equal.
+typesAreEqual :: EqualityProver' Type Bool
+typesAreEqual s t1 t2 = equalityResultIsSuccess (\(a, _, _) -> a) (equalTypes s t1 t2)
+
+
+-- | True if the two types are equal.
+typesAreEqualWithCheck :: EqualityProver' Type Bool
+typesAreEqualWithCheck s t1 t2 = equalityResultIsSuccessAndAct (equalTypes s t1 t2)
+
+
+lTypesAreEqual :: EqualityProver' Type Bool
+lTypesAreEqual s t1 t2 = equalityResultIsSuccess fst (lEqualTypes s t1 t2)
+
+
+requireEqualTypes :: EqualityProver' Type (Bool, Substitution)
+requireEqualTypes s t1 t2 = do
+  (areEqual, _, subst) <- equalTypes s t1 t2
+  if areEqual then pure (areEqual, subst) else throw TypeError { errLoc = s, tyExpected = t1, tyActual = t2 }
+
+
+requireEqualTypesRelatedCoeffects :: EqualityProver Type Bool
+requireEqualTypesRelatedCoeffects s rel spec t1 t2 =
+    requireEqualTypesRelatedCoeffects s rel spec t1 t2
+
+
+lEqualTypesWithPolarity :: EqualityProverWithSpec Type EqualityResult
+lEqualTypesWithPolarity s pol t1 t2 = equalTypesRelatedCoeffects s ApproximatedBy t1 t2 pol
+
+
+equalTypesWithPolarity :: EqualityProverWithSpec Type EqualityResult
+equalTypesWithPolarity s pol t1 t2 = equalTypesRelatedCoeffects s Eq t1 t2 pol
+
+
+lEqualTypes :: EqualityProver' Type EqualityResult
+lEqualTypes s t1 t2 = equalTypesRelatedCoeffects s ApproximatedBy t1 t2 SndIsSpec
+
+
+equalTypes :: EqualityProver' Type (Bool, Type, Substitution)
 equalTypes s = equalTypesRelatedCoeffectsAndUnify s Eq SndIsSpec
 
-equalTypesWithUniversalSpecialisation :: (?globals :: Globals)
-  => Span -> Type -> Type -> Checker (Bool, Type, Substitution)
-equalTypesWithUniversalSpecialisation s = equalTypesRelatedCoeffectsAndUnify s Eq SndIsSpec
+
+equalTypesWithUniversalSpecialisation :: EqualityProver' Type EqualityResult
+equalTypesWithUniversalSpecialisation s t1 t2 =
+  equalTypesRelatedCoeffects s Eq t1 t2 SndIsSpec
+
+
+-- | Indicates whether the first type or second type is a specification.
+data SpecIndicator = FstIsSpec | SndIsSpec | PatternCtxt
+  deriving (Eq, Show)
+
+
+flipIndicator :: SpecIndicator -> SpecIndicator
+flipIndicator FstIsSpec = SndIsSpec
+flipIndicator SndIsSpec = FstIsSpec
+flipIndicator PatternCtxt = PatternCtxt
+
 
 {- | Check whether two types are equal, and at the same time
      generate coeffect equality constraints and unify the
@@ -70,7 +270,6 @@ equalTypesRelatedCoeffectsAndUnify :: (?globals :: Globals)
   --    * the unifier
   -> Checker (Bool, Type, Substitution)
 equalTypesRelatedCoeffectsAndUnify s rel spec t1 t2 = do
-
    (eq, unif) <- equalTypesRelatedCoeffects s rel t1 t2 spec
    if eq
      then do
@@ -78,13 +277,6 @@ equalTypesRelatedCoeffectsAndUnify s rel spec t1 t2 = do
         return (eq, t2, unif)
      else return (eq, t1, [])
 
-data SpecIndicator = FstIsSpec | SndIsSpec | PatternCtxt
-  deriving (Eq, Show)
-
-flipIndicator :: SpecIndicator -> SpecIndicator
-flipIndicator FstIsSpec = SndIsSpec
-flipIndicator SndIsSpec = FstIsSpec
-flipIndicator PatternCtxt = PatternCtxt
 
 {- | Check whether two types are equal, and at the same time
      generate coeffect equality constraints and a unifier
@@ -169,8 +361,8 @@ equalTypesRelatedCoeffectsInner s rel x@(Box c t) y@(Box c' t') k sp = do
 equalTypesRelatedCoeffectsInner s _ (TyVar n) (TyVar m) _ _ | n == m = do
   checkerState <- get
   case lookup n (tyVarContext checkerState) of
-    Just _ -> return (True, [])
-    Nothing -> throw UnboundTypeVariable { errLoc = s, errId = n }
+    Just _ -> trivialEquality
+    Nothing -> miscErr $ UnboundTypeVariable{ errLoc = s, errId = n }
 
 equalTypesRelatedCoeffectsInner s _ (TyVar n) (TyVar m) sp _ = do
   checkerState <- get
@@ -180,9 +372,8 @@ equalTypesRelatedCoeffectsInner s _ (TyVar n) (TyVar m) sp _ = do
 
   case (lookup n (tyVarContext checkerState), lookup m (tyVarContext checkerState)) of
 
-    -- Two universally quantified variables are unequal
     (Just (_, ForallQ), Just (_, ForallQ)) ->
-        return (False, [])
+        twoUniversallyQuantifiedVariablesAreUnequal s n m
 
     -- We can unify a universal a dependently bound universal
     (Just (k1, ForallQ), Just (k2, BoundQ)) ->
@@ -216,9 +407,13 @@ equalTypesRelatedCoeffectsInner s _ (TyVar n) (TyVar m) sp _ = do
     (Just (k1, ForallQ), Just (k2, InstanceQ)) ->
         tyVarConstraint (k1, n) (k2, m)
 
-    (t1, t2) -> error $ pretty s <> "-" <> show sp <> "\n"
-              <> pretty n <> " : " <> show t1
-              <> "\n" <> pretty m <> " : " <> show t2
+    (t1, t2) -> miscErr $ NotImplemented {
+                  errLoc = s
+                , errDesc =
+                    concat [ show sp, "\n"
+                           , pretty n, " : ", show t1, "\n"
+                           , pretty m, " : ", show t2 ]
+                }
   where
     tyVarConstraint (k1, n) (k2, m) = do
       case k1 `joinKind` k2 of
@@ -265,8 +460,7 @@ equalTypesRelatedCoeffectsInner s rel (TyVar n) t kind sp = do
     (Just (k1, q)) | (q == BoundQ) || (q == InstanceQ) -> do --  && sp /= PatternCtxt
 
       case k1 `joinKind` kind of
-        Nothing -> throw UnificationKindError
-          { errLoc = s, errTy1 = (TyVar n), errK1 = k1, errTy2 = t, errK2 = kind }
+        Nothing -> illKindedUnifyVar s (n, k1) (t, kind)
 
         -- If the kind is Nat, then create a solver constraint
         Just (KPromote (TyCon (internalName -> "Nat")), unif) -> do
@@ -287,11 +481,11 @@ equalTypesRelatedCoeffectsInner s rel (TyVar n) t kind sp = do
            addConstraint $ Eq s c1 c2 (TyCon $ mkId "Nat")
            return (True, unif ++ [(n, SubstT t)])
 
-         _ -> throw UnificationFail{ errLoc = s, errVar = n, errKind = k1, errTy = t }
+         _ -> cannotUnifyUniversalWithConcrete s n k1 t
 
     (Just (_, InstanceQ)) -> error "Please open an issue at https://github.com/dorchard/granule/issues"
     (Just (_, BoundQ)) -> error "Please open an issue at https://github.com/dorchard/granule/issues"
-    Nothing -> throw UnboundTypeVariable { errLoc = s, errId = n }
+    Nothing -> miscErr $ UnboundVariableError{ errLoc = s, errId = n }
 
 
 equalTypesRelatedCoeffectsInner s rel t (TyVar n) k sp =
@@ -312,6 +506,15 @@ equalTypesRelatedCoeffectsInner s rel (TyApp t1 t2) (TyApp t1' t2') _ sp = do
   (two, u2) <- equalTypesRelatedCoeffects s rel t2 t2' sp
   unifiers <- combineSubstitutions s u1 u2
   return (one && two, unifiers)
+
+equalTypesRelatedCoeffectsInner s rel t1@(TyCoeffect c1) t2@(TyCoeffect c2) _ sp = do
+  (kind, _) <- mguCoeffectTypes s c1 c2
+  case sp of
+    SndIsSpec ->
+      equalWith ([rel s c1 c2 kind], [])
+    FstIsSpec ->
+      equalWith ([rel s c2 c1 kind], [])
+    _ -> contextDoesNotAllowUnification s t1 t2
 
 equalTypesRelatedCoeffectsInner s rel t1 t2 k sp = do
   effTyM <- isEffectTypeFromKind s k
@@ -349,11 +552,10 @@ equalOtherKindedTypesGeneric s t1 t2 k = do
     KPromote (TyCon (internalName -> "Protocol")) ->
       sessionInequality s t1 t2
 
-    KType -> throw UnificationError{ errLoc = s, errTy1 = t1, errTy2 = t2}
+    KType -> nonUnifiable s t1 t2
 
     _ ->
-      throw UndefinedEqualityKindError
-        { errLoc = s, errTy1 = t1, errK1 = k, errTy2 = t2, errK2 = k }
+      kindEqualityIsUndefined s k k t1 t2
 
 -- Essentially use to report better error messages when two session type
 -- are not equality
@@ -371,9 +573,9 @@ sessionInequality s (TyApp (TyCon c) t) (TyApp (TyCon c') t')
 
 sessionInequality s (TyCon c) (TyCon c')
   | internalName c == "End" && internalName c' == "End" =
-  return (True, [])
+  trivialEquality
 
-sessionInequality s t1 t2 = throw TypeError{ errLoc = s, tyExpected = t1, tyActual = t2 }
+sessionInequality s t1 t2 = unequalSessionTypes s t1 t2
 
 isDualSession :: (?globals :: Globals)
     => Span
@@ -394,7 +596,7 @@ isDualSession sp rel (TyApp (TyApp (TyCon c) t) s) (TyApp (TyApp (TyCon c') t') 
 
 isDualSession _ _ (TyCon c) (TyCon c') _
   | internalName c == "End" && internalName c' == "End" =
-  return (True, [])
+  trivialEquality
 
 isDualSession sp rel t (TyVar v) ind =
   equalTypesRelatedCoeffects sp rel (TyApp (TyCon $ mkId "Dual") t) (TyVar v) ind
@@ -402,8 +604,7 @@ isDualSession sp rel t (TyVar v) ind =
 isDualSession sp rel (TyVar v) t ind =
   equalTypesRelatedCoeffects sp rel (TyVar v) (TyApp (TyCon $ mkId "Dual") t) ind
 
-isDualSession sp _ t1 t2 _ = throw
-  SessionDualityError{ errLoc = sp, errTy1 = t1, errTy2 = t2 }
+isDualSession sp _ t1 t2 _ = sessionsNotDual sp t1 t2
 
 
 -- Essentially equality on types but join on any coeffects
@@ -517,3 +718,28 @@ twoEqualEffectTypes s ef1 ef2 = do
             else throw $ KindMismatch { errLoc = s, tyActualK = Just ef1, kExpected = KPromote efTy1, kActual = KPromote efTy2 }
           Left k -> throw $ UnknownResourceAlgebra { errLoc = s, errTy = ef2 , errK = k }
       Left k -> throw $ UnknownResourceAlgebra { errLoc = s, errTy = ef1 , errK = k }
+
+
+----------------------------
+----- Instance Helpers -----
+----------------------------
+
+
+-- | Prove or disprove the equality of two instances in the current context.
+equalInstances :: (?globals :: Globals) => Span -> Inst -> Inst -> Checker EqualityResult
+equalInstances sp instx insty =
+  let ts1 = instParams instx
+      ts2 = instParams insty
+  in foldM (\(eq, u) (t1,t2) -> do
+              (eq', t, u') <- equalTypes sp t1 t2
+              u2 <- combineSubstitutions sp u u'
+              pure (eq && eq', u2)) trivialEquality' (zip ts1 ts2)
+
+-- TODO: update this (instancesAreEqual) to use 'solveConstraintsSafe' to
+-- determine if two instances are equal after solving.
+-- "instancesAreEqual'" (in Checker) should then be removed
+--      - GuiltyDolphin (2019-03-17)
+
+-- | True if the two instances can be proven to be equal in the current context.
+instancesAreEqual :: (?globals :: Globals) => Span -> Inst -> Inst -> Checker Bool
+instancesAreEqual s t1 t2 = equalityResultIsSuccess fst (equalInstances s t1 t2)

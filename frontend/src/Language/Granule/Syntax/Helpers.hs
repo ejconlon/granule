@@ -6,7 +6,7 @@
 
 module Language.Granule.Syntax.Helpers where
 
-import Data.List (delete)
+import Data.List (delete, nub)
 import Control.Monad.Trans.State.Strict
 import Control.Monad.Fail
 import Control.Monad.Identity
@@ -35,6 +35,9 @@ class Term t where
   freeVars :: t -> [Id]
   hasHole :: t -> Bool
   hasHole _ = False
+
+instance {-# OVERLAPPABLE #-} (Foldable f, Term t) => Term (f t) where
+  freeVars = nub . concatMap freeVars
 
 -- Used to distinguish the value-level and type-level variables
 data IdSyntacticCategory = Value | Type

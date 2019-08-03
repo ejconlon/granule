@@ -8,6 +8,7 @@ module Language.Granule.Checker.Substitution where
 
 import Control.Monad
 import Control.Monad.State.Strict
+import Data.Function (on)
 import Data.Maybe (mapMaybe)
 import Data.Bifunctor.Foldable (bicataM)
 
@@ -22,6 +23,12 @@ import Language.Granule.Syntax.Type
 
 import Language.Granule.Checker.SubstitutionContexts
 import Language.Granule.Checker.Constraints.Compile
+import Language.Granule.Checker.Instance
+import Language.Granule.Checker.Interface
+  ( getInterfaceParameterNames
+  , getInterfaceParameterKinds
+  , buildBindingMap
+  )
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.Kinds
 import Language.Granule.Checker.Predicates
@@ -71,7 +78,8 @@ instance Substitutable Type where
   substitute subst = typeFoldM (baseTypeFold
                               { tfTyVar = varSubst
                               , tfBox = box
-                              , tfDiamond = dia })
+                              , tfDiamond = dia
+                              , tfTyCoeffect = coeffSubst })
     where
       box c t = do
         c <- substitute subst c
@@ -81,10 +89,25 @@ instance Substitutable Type where
         e <- substitute subst e
         mDiamond e t
 
+      coeffSubst c = substitute subst c >>= mTyCoeffect
+
       varSubst v =
-         case lookup v subst of
-           Just (SubstT t) -> return t
-           _               -> mTyVar v
+         let finalSub = lookupWithTransitive [] v
+         in case finalSub of
+              (SubstT t) -> pure t
+              _          -> mTyVar v
+      lookupWithTransitive seen var = do
+        -- make sure we don't infinitely recurse when a
+        -- variable substitutes to itself
+        if (var `elem` seen) then (SubstT (TyVar var))
+        else
+          case lookup var subst of
+            -- variable doesn't point anywhere, so this is a name substitution
+            Nothing -> SubstT (TyVar var)
+            -- points to a variable, so try and resolve it as much as possible
+            Just vs@(SubstT (TyVar v2)) -> lookupWithTransitive (var:seen) v2
+            -- points to something other than a variable
+            Just s -> s
 
 instance Substitutable Coeffect where
 
@@ -141,6 +164,7 @@ instance Substitutable Coeffect where
                                                                     v (promoteTypeToKind k', q) }
                     _ -> return ()
                 return c
+            Just (SubstT (TyCoeffect c)) -> pure c
             -- Convert a single type substitution (type variable, type pair) into a
             -- coeffect substituion
             Just (SubstT t) -> do
@@ -187,7 +211,7 @@ instance Substitutable Kind where
   substitute subst KType = return KType
   substitute subst KEffect = return KEffect
   substitute subst KCoeffect = return KCoeffect
-  substitute subst KPredicate = return KPredicate
+  substitute subst c@(KConstraint _) = return c
   substitute subst (KFun c1 c2) = do
     c1 <- substitute subst c1
     c2 <- substitute subst c2
@@ -215,12 +239,22 @@ xs <<>> ys =
          combineSubstitutions nullSpan xs' ys' >>= (return . Just)
     _ -> return Nothing
 
+
 combineManySubstitutions :: (?globals :: Globals)
     => Span -> [Substitution] -> Checker Substitution
 combineManySubstitutions s [] = return []
 combineManySubstitutions s (subst:ss) = do
   ss' <- combineManySubstitutions s ss
   combineSubstitutions s subst ss'
+
+
+combineManySubstitutionsSafe :: (?globals :: Globals)
+    => Span -> [Substitution]  -> Checker (Either FailedCombination Substitution)
+combineManySubstitutionsSafe s [] = pure . pure $ mempty
+combineManySubstitutionsSafe s (subst:ss) = do
+  r1 <- combineManySubstitutionsSafe s ss
+  either (pure . Left) (combineSubstitutionsSafe s subst) r1
+
 
 removeReflexivePairs :: Substitution -> Substitution
 removeReflexivePairs [] = []
@@ -229,12 +263,19 @@ removeReflexivePairs ((v, SubstC (CVar v')):subst) | v == v' = removeReflexivePa
 removeReflexivePairs ((v, SubstK (KVar v')):subst) | v == v' = removeReflexivePairs subst
 removeReflexivePairs ((v, e):subst) = (v, e) : removeReflexivePairs subst
 
+
+-- | An indication that two substitutions failed to combine,
+-- | where there are conflicting substitutors for the same
+-- | identifier.
+type FailedCombination = (Id, Substitutors, Substitutors)
+
+
 -- | Combines substitutions which may fail if there are conflicting
--- | substitutions
-combineSubstitutions ::
+-- | substitutions.
+combineSubstitutionsSafe ::
     (?globals :: Globals)
-    => Span -> Substitution -> Substitution -> Checker Substitution
-combineSubstitutions sp u1 u2 = do
+    => Span -> Substitution -> Substitution -> Checker (Either FailedCombination Substitution)
+combineSubstitutionsSafe sp u1 u2 = do
       -- Remove any substitutions that say things like `a |-> a`. This leads to infite loops
       u1 <- return $ removeReflexivePairs u1
       u2 <- return $ removeReflexivePairs u2
@@ -244,41 +285,38 @@ combineSubstitutions sp u1 u2 = do
       uss1 <- forM u1 $ \(v, s) ->
         case lookupMany v u2 of
           -- Unifier in u1 but not in u2
-          [] -> return [(v, s)]
+          [] -> pure $ pure [(v, s)]
           -- Possible unifications in each part
           alts -> do
               unifs <-
                 forM alts $ \s' -> do
-                   --(us, t) <- unifiable v t t' t t'
                    us <- unify s s'
                    case us of
-                     Nothing -> throw UnificationFailGeneric { errLoc = sp, errSubst1 = s, errSubst2 = s' }
+                     Nothing -> pure $ Left (v, s, s')
                      Just us -> do
                        sUnified <- substitute us s
-                       combineSubstitutions sp [(v, sUnified)] us
+                       combineSubstitutionsSafe sp [(v, sUnified)] us
 
-              return $ concat unifs
+              pure $ either Left (Right . concat) $ sequence unifs
       -- Any remaining unifiers that are in u2 but not u1
       uss2 <- forM u2 $ \(v, s) ->
          case lookup v u1 of
            Nothing -> return [(v, s)]
            _       -> return []
-      let uss = concat uss1 <> concat uss2
-      return $ reduceByTransitivity uss
+      pure $ fmap (\uss1 -> concat uss1 <> concat uss2) (sequence uss1)
 
-reduceByTransitivity :: Substitution -> Substitution
-reduceByTransitivity ctxt = reduceByTransitivity' [] ctxt
- where
-   reduceByTransitivity' :: Substitution -> Substitution -> Substitution
-   reduceByTransitivity' subst [] = subst
 
-   reduceByTransitivity' substLeft (subst@(var, SubstT (TyVar var')):substRight) =
-     case lookupAndCutout var' (substLeft ++ substRight) of
-       Just (substRest, t) -> (var, t) : reduceByTransitivity ((var', t) : substRest)
-       Nothing             -> reduceByTransitivity' (subst : substLeft) substRight
+-- | Combines substitutions which may fail if there are conflicting
+-- | substitutions
+combineSubstitutions ::
+    (?globals :: Globals)
+    => Span -> Substitution -> Substitution -> Checker Substitution
+combineSubstitutions sp u1 u2 = do
+  subst <- combineSubstitutionsSafe sp u1 u2
+  case subst of
+    Left (v, s, s') -> throw UnificationFailGeneric { errLoc = sp, errSubst1 = s, errSubst2 = s' }
+    Right res -> pure res
 
-   reduceByTransitivity' substLeft (subst:substRight) =
-     reduceByTransitivity' (subst:substLeft) substRight
 
 {-| Take a context of 'a' and a subhstitution for 'a's (also a context)
   apply the substitution returning a pair of contexts, one for parts
@@ -321,6 +359,7 @@ renameType :: (?globals :: Globals) => [(Id, Id)] -> Type -> Checker Type
 renameType subst = typeFoldM $ baseTypeFold
   { tfBox   = renameBox subst
   , tfTyVar = renameTyVar subst
+  , tfTyCoeffect = renameTyCoeffect subst
   }
   where
     renameBox renameMap c t = do
@@ -332,6 +371,9 @@ renameType subst = typeFoldM $ baseTypeFold
         Just v' -> return $ TyVar v'
         -- Shouldn't happen
         Nothing -> return $ TyVar v
+    renameTyCoeffect renameMap c = do
+      c' <- substitute (map (\(v, var) -> (v, SubstC $ CVar var)) renameMap) c
+      pure . TyCoeffect $ c'
 
 -- | Get a fresh polymorphic instance of a type scheme and list of instantiated type variables
 -- and their new names.
@@ -342,11 +384,11 @@ freshPolymorphicInstance :: (?globals :: Globals)
   -> Substitution -- ^ A substitution associated with this type scheme (e.g., for
                   --     data constructors of indexed types) that also needs freshening
 
-  -> Checker (Type, Ctxt Kind, Substitution, [Type], Substitution)
+  -> Checker (Type, Ctxt Kind, Substitution, ([Type], [Inst]), Substitution)
     -- Returns the type (with new instance variables)
        -- a context of all the instance variables kinds (and the ids they replaced)
        -- a substitution from the visible instance variable to their originals
-       -- a list of the (freshened) constraints for this scheme
+       -- a list of the (freshened) constraints for this scheme (as a pair (predicates, interfaces))
        -- a correspondigly freshened version of the parameter substitution
 freshPolymorphicInstance quantifier isDataConstructor (Forall s kinds constr ty) ixSubstitution = do
     -- Universal becomes an existential (via freshCoeffeVar)
@@ -357,6 +399,7 @@ freshPolymorphicInstance quantifier isDataConstructor (Forall s kinds constr ty)
 
     let subst = map (\(v, (_, var)) -> (v, SubstT $ TyVar var)) $ elideEither renameMap
     constr' <- mapM (substitute subst) constr
+    let (predicateConstraints, interfaceConstraints) = partitionConstraints constr'
 
     -- Return the type and all instance variables
     let newTyVars = map (\(_, (k, v')) -> (v', k))  $ elideEither renameMap
@@ -364,7 +407,9 @@ freshPolymorphicInstance quantifier isDataConstructor (Forall s kinds constr ty)
 
     ixSubstitution' <- substitute substitution ixSubstitution
 
-    return (ty, newTyVars, substitution, constr', ixSubstitution')
+    return (ty, newTyVars, substitution,
+             (predicateConstraints, interfaceConstraints),
+             ixSubstitution')
 
   where
     -- Freshen variables, create instance variables
@@ -392,6 +437,12 @@ freshPolymorphicInstance quantifier isDataConstructor (Forall s kinds constr ty)
     justLefts = mapMaybe conv
       where conv (v, Left a)  = Just (v,  a)
             conv (v, Right _) = Nothing
+
+instance Substitutable TypeScheme where
+  substitute ctxt (Forall s binds constrs ty) = do
+    constrs' <- mapM (substitute ctxt) constrs
+    ty' <- substitute ctxt ty
+    pure $ Forall s binds constrs' ty'
 
 instance Substitutable Pred where
   substitute ctxt =
@@ -440,12 +491,13 @@ instance Substitutable Constraint where
   substitute ctxt (LtEq s c1 c2) = LtEq s <$> substitute ctxt c1 <*> substitute ctxt c2
   substitute ctxt (GtEq s c1 c2) = GtEq s <$> substitute ctxt c1 <*> substitute ctxt c2
 
-instance Substitutable (Equation () Type) where
+instance Substitutable (Equation v Type) where
   substitute ctxt (Equation sp ty patterns expr) =
       do ty' <- substitute ctxt ty
          pat' <- mapM (substitute ctxt) patterns
          expr' <- substitute ctxt expr
          return $ Equation sp ty' pat' expr'
+
 
 substituteValue :: (?globals::Globals)
                 => Substitution
@@ -455,20 +507,31 @@ substituteValue ctxt (AbsF ty arg mty expr) =
     do  ty' <- substitute ctxt ty
         arg' <- substitute ctxt arg
         mty' <- mapM (substitute ctxt) mty
-        return $ Abs ty' arg' mty' expr
+        expr' <- substitute ctxt expr
+        pure $ Abs ty' arg' mty' expr'
 substituteValue ctxt (PromoteF ty expr) =
     do  ty' <- substitute ctxt ty
-        return $ Promote ty' expr
+        expr' <- substitute ctxt expr
+        pure $ Promote ty' expr'
 substituteValue ctxt (PureF ty expr) =
     do  ty' <- substitute ctxt ty
-        return $ Pure ty' expr
+        expr' <- substitute ctxt expr
+        pure $ Pure ty' expr'
 substituteValue ctxt (ConstrF ty ident vs) =
     do  ty' <- substitute ctxt ty
-        return $ Constr ty' ident vs
+        vs' <- mapM (substitute ctxt) vs
+        pure $ Constr ty' ident vs'
+substituteValue ctxt (VarF ty n) = do
+    do  ty' <- substitute ctxt ty
+        pure $ Var ty' n
 substituteValue ctxt (ExtF ty ev) =
     do  ty' <- substitute ctxt ty
-        return $ Ext ty' ev
-substituteValue _ other = return (ExprFix2 other)
+        pure $ Ext ty' ev
+substituteValue _ (NumIntF n) = pure $ NumInt n
+substituteValue _ (NumFloatF n) = pure $ NumFloat n
+substituteValue _ (CharLiteralF n) = pure $ CharLiteral n
+substituteValue _ (StringLiteralF n) = pure $ StringLiteral n
+
 
 substituteExpr :: (?globals::Globals)
                => Substitution
@@ -476,18 +539,25 @@ substituteExpr :: (?globals::Globals)
                -> Checker (Expr ev Type)
 substituteExpr ctxt (AppF sp ty fn arg) =
     do  ty' <- substitute ctxt ty
-        return $ App sp ty' fn arg
+        fn' <- substitute ctxt fn
+        arg' <- substitute ctxt arg
+        pure $ App sp ty' fn' arg'
 substituteExpr ctxt (BinopF sp ty op lhs rhs) =
     do  ty' <- substitute ctxt ty
-        return $ Binop sp ty' op lhs rhs
+        lhs' <- substitute ctxt lhs
+        rhs' <- substitute ctxt rhs
+        pure $ Binop sp ty' op lhs' rhs'
 substituteExpr ctxt (LetDiamondF sp ty pattern mty value expr) =
     do  ty' <- substitute ctxt ty
         pattern' <- substitute ctxt pattern
         mty' <- mapM (substitute ctxt) mty
-        return $ LetDiamond sp ty' pattern' mty' value expr
+        value' <- substitute ctxt value
+        expr' <- substitute ctxt expr
+        pure $ LetDiamond sp ty' pattern' mty' value' expr'
 substituteExpr ctxt (ValF sp ty value) =
     do  ty' <- substitute ctxt ty
-        return $ Val sp ty' value
+        value' <- substitute ctxt value
+        pure $ Val sp ty' value'
 substituteExpr ctxt (CaseF sp ty expr arms) =
     do  ty' <- substitute ctxt ty
         arms' <- mapM (mapFstM (substitute ctxt)) arms
@@ -499,10 +569,10 @@ mapFstM fn (f, r) = do
     f' <- fn f
     return (f', r)
 
-instance Substitutable (Expr () Type) where
+instance Substitutable (Expr v Type) where
   substitute ctxt = bicataM (substituteExpr ctxt) (substituteValue ctxt)
 
-instance Substitutable (Value () Type) where
+instance Substitutable (Value v Type) where
   substitute ctxt = bicataM (substituteValue ctxt) (substituteExpr ctxt)
 
 instance Substitutable (Pattern Type) where
@@ -525,6 +595,60 @@ instance Substitutable (Pattern Type) where
       (\sp ann nm pats -> do
           ann' <- substitute ctxt ann
           return $ PConstr sp ann' nm pats)
+
+
+instance Substitutable Inst where
+  substitute ctxt inst = do
+    let iname = instIFace inst
+        params = instParams inst
+    params' <- mapM (substitute ctxt) params
+    pure $ mkInst iname params'
+
+
+instance Unifiable Inst where
+  unify = unify `on` tyFromInst
+
+
+instance {-# OVERLAPPABLE #-} (Substitutable a) => Substitutable [a] where
+  substitute ctxt = mapM (substitute ctxt)
+
+
+---------------------------
+----- Context Helpers -----
+---------------------------
+
+
+getInstanceSubstitution :: (?globals :: Globals) => Span -> Inst -> Checker Substitution
+getInstanceSubstitution sp inst = do
+  names <- getInterfaceParameterNames sp (instIFace inst)
+  kinds <- getInterfaceParameterKindsForInst sp inst
+  forM (zip3 (instParams inst) names kinds) getVarSubst
+  where getVarSubst (param, name, kind) =
+          case kind of
+            KPromote (TyCon n) | internalName n == "Nat" -> do
+              coeff <- compileNatKindedTypeToCoeffect sp param
+              pure (name, SubstC coeff)
+            KPromote t -> do
+              k <- inferKindOfType sp t
+              case k of
+                KCoeffect -> pure $ case param of
+                                      -- when the parameter itself is a coeffect, we can substitute
+                                      -- the name to that coeffect
+                                      (TyCoeffect c) -> (name, SubstC c)
+                                      _ -> (name, SubstK (KPromote t))
+                _ -> pure (name, SubstT param)
+            _ -> pure (name, SubstT param)
+
+
+-- | Get the resolved kinds of an interface at a particular
+-- | instance.
+-- |
+-- | This function resolves kind dependencies (e.g., (a : Kind) (b : a)).
+getInterfaceParameterKindsForInst :: (?globals :: Globals) => Span -> Inst -> Checker [Kind]
+getInterfaceParameterKindsForInst sp inst = do
+  bindMap <- buildBindingMap sp inst
+  pkinds <- getInterfaceParameterKinds sp (instIFace inst)
+  substitute bindMap pkinds
 
 class Unifiable t where
     unify :: (?globals :: Globals) => t -> t -> Checker (Maybe Substitution)

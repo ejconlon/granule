@@ -1,0 +1,13 @@
+interface Simple a where
+  simple : a -> a
+
+data A = A'
+
+data B = B'
+
+-- two instances
+instance Simple A where
+  simple x = x
+
+instance Simple B where
+  simple x = x

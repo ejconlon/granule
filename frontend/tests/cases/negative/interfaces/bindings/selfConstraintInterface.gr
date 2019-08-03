@@ -1,0 +1,4 @@
+-- interface is a constraint to itself
+--
+-- technically not in scope
+interface {Simple a} => Simple a

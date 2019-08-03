@@ -1,0 +1,7 @@
+interface Simple (a : Type -> Type)
+
+
+-- we expect 'a' to have kind 'Type -> Type' for Simple,
+-- but instead have kind 'Type'
+foo : forall {a : Type} . {Simple a} => a -> a
+foo x = x

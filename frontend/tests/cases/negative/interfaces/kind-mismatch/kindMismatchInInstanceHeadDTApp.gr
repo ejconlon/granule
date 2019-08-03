@@ -1,0 +1,8 @@
+data A a = A'
+
+data B b = B'
+
+interface Simple a
+
+-- correct version would be (A (B b))
+instance Simple (A B)

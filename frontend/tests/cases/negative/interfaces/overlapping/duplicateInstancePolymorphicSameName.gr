@@ -1,0 +1,6 @@
+interface Simple a
+
+-- duplicate instance for a (polymorphic) type
+instance Simple a
+
+instance Simple a

@@ -1,0 +1,5 @@
+interface Simple (a : Type) (b : Coeffect) (c : b)
+
+data A = B
+
+instance Simple A Nat 1

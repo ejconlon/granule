@@ -32,8 +32,8 @@ kindCheckDef (Def s id eqs (Forall s' quantifiedVariables constraints ty)) = do
   forM_ constraints $ \constraint -> do
     (kind, _) <- inferKindOfTypeImplicits s quantifiedVariables constraint
     case kind of
-      KPredicate -> return ()
-      _ -> throw KindMismatch{ errLoc = s, tyActualK = Just constraint, kExpected = KPredicate, kActual = kind }
+      KConstraint _ -> return ()
+      _ -> throw KindMismatch{ errLoc = s, tyActualK = Just constraint, kExpected = KConstraint Predicate, kActual = kind }
 
   ty <- return $ replaceSynonyms ty
   (kind, unifiers) <- inferKindOfTypeImplicits s quantifiedVariables ty
@@ -104,6 +104,10 @@ inferKindOfTypeImplicits s ctxt (Box c t) = do
         u'' <- combineSubstitutions s u u'
         return (KType, u'')
       _ -> throw KindMismatch{ errLoc = s, tyActualK = Just t, kExpected = KType, kActual = k }
+
+inferKindOfTypeImplicits s ctxt (TyCoeffect c) = do
+    _ <- inferCoeffectTypeInContext s ctxt c
+    pure (kConstr $ mkId "Coeffect", [])
 
 inferKindOfTypeImplicits s ctxt (Diamond e t) = do
   (ke, u') <- inferKindOfTypeImplicits s ctxt e

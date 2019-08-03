@@ -1,0 +1,8 @@
+interface Simple a
+
+data A = A'
+
+-- duplicate instance for a type
+instance Simple A
+
+instance Simple A

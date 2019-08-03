@@ -19,5 +19,5 @@ spec = do
       Right us <- evalChecker initState $
              unify (Box (CVar $ mkId "x") (TyCon $ mkId "Bool"))
                    (Box (COne (TyCon $ mkId "Nat")) (TyVar $ mkId "a"))
-      us `shouldBe` (Just [(mkId "a", SubstT $ TyCon $ mkId "Bool")
-                          , (mkId "x", SubstC $ COne (TyCon $ mkId "Nat"))])
+      us `shouldBe` (Just [ (mkId "x", SubstC . COne $ con "Nat")
+                          , (mkId "a", SubstT $ con "Bool")])

@@ -1,0 +1,4 @@
+data A = A'
+
+-- interface name clashes with type constructor
+interface A a

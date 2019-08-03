@@ -29,6 +29,24 @@ prettyDebug x =
 pretty :: (?globals :: Globals, Pretty t) => t -> String
 pretty = prettyL 0
 
+
+-- | Return the pretty-printed representation of a value, enclosed
+-- | within the given delimiters.
+prettyWithin :: (?globals :: Globals, Pretty t) => Char -> Char -> t -> String
+prettyWithin c1 c2 x = [c1] <> pretty x <> [c2]
+
+
+-- | Return the pretty-printed representation of a value, enclosed
+-- | within the given delimiter.
+prettyQuotedDelim :: (?globals :: Globals, Pretty t) => Char -> t -> String
+prettyQuotedDelim c = prettyWithin c c
+
+
+-- | Pretty-print the value within backticks.
+prettyQuoted :: (?globals :: Globals, Pretty t) => t -> String
+prettyQuoted = prettyQuotedDelim '`'
+
+
 type Level = Int
 
 parens :: Level -> String -> String
@@ -113,7 +131,8 @@ instance Pretty Kind where
     prettyL l KType          = "Type"
     prettyL l KEffect      = "Effect"
     prettyL l KCoeffect      = "Coeffect"
-    prettyL l KPredicate     = "Predicate"
+    prettyL l (KConstraint Predicate) = "Predicate constraint"
+    prettyL l (KConstraint InterfaceC) = "Interface constraint"
     prettyL l (KFun k1 k2)   = prettyL l k1 <> " -> " <> prettyL l k2
     prettyL l (KVar v)       = prettyL l v
     prettyL l (KPromote t)   = "↑" <> prettyL l t
@@ -124,7 +143,7 @@ instance Pretty TypeScheme where
       where
         kVars [] = ""
         kVars vs = "\n  forall {" <> intercalate ", " (map prettyKindSignatures vs) <> "}\n  . "
-        prettyKindSignatures (var, kind) = prettyL l var <> " : " <> prettyL l kind
+        prettyKindSignatures (var, kind) = prettyColonSep l var kind
         constraints [] = ""
         constraints cs = "\n  {" <> intercalate ", " (map (prettyL l) cs) <> "}\n  => "
 
@@ -133,6 +152,7 @@ instance Pretty Type where
     prettyL l (TyCon s)      =  prettyL 0 s
     prettyL l (TyVar v)      = prettyL 0 v
     prettyL l (TyInt n)      = show n
+    prettyL _ (TyCoeffect c) = prettyL 0 c
 
     -- Non atoms
     prettyL l (FunTy t1 t2)  =
@@ -141,7 +161,7 @@ instance Pretty Type where
         _       ->  prettyL l t1 <> " -> " <> prettyL l t2
 
     prettyL l (Box c t)      =
-       parens l (prettyL (l+1) t <> " [" <> prettyL l c <> "]")
+      parens l (parens (l+1) (prettyL l t) <> " [" <> prettyL l c <> "]")
 
     prettyL l (Diamond e t) =
       parens l (prettyL (l+1) t <> " <" <> prettyL l e <> ">")
@@ -165,7 +185,7 @@ instance Pretty Type where
     prettyL l (TyInfix op t1 t2) =
       parens l (prettyL (l+1) t1 <> " " <> prettyL l op <> " " <>  prettyL (l+1) t2)
 
-    prettyL l (TySet ts) = 
+    prettyL l (TySet ts) =
       parens l ("{" <> intercalate ", " (map (prettyL l) ts) <> "}")
 
 instance Pretty TypeOperator where
@@ -189,18 +209,20 @@ appChain (TyApp (TyApp t1 t2) _) = appChain (TyApp t1 t2)
 appChain (TyApp t1 t2)           = True
 appChain _                       = False
 
-instance Pretty v => Pretty (AST v a) where
-    prettyL l (AST dataDecls defs imprts)
-        = (unlines . map ("import " <>) . toList) imprts
-        <> "\n\n" <> pretty' dataDecls
-        <> "\n\n" <> pretty' defs
+instance (Pretty v) => Pretty (AST v a) where
+    prettyL l (AST dataDecls defs ifaces insts imports) =
+      concat [(unlines . map ("import " <>) . toList) imports, "\n\n",
+              pretty' dataDecls, "\n\n",
+              pretty' ifaces, "\n\n",
+              pretty' defs, "\n\n",
+              pretty' insts]
       where
         pretty' :: Pretty l => [l] -> String
         pretty' = intercalate "\n\n" . map pretty
 
 instance Pretty v => Pretty (Def v a) where
     prettyL l (Def _ v eqs (Forall _ [] [] t))
-      = prettyL l v <> " : " <> prettyL l t <> "\n" <> intercalate "\n" (map (prettyEqn v) eqs)
+      = prettyColonSep l v t <> "\n" <> intercalate "\n" (map (prettyEqn v) eqs)
     prettyL l (Def _ v eqs tySch)
       = prettyL l v <> "\n  : " <> prettyL l tySch <> "\n" <> intercalate "\n" (map (prettyEqn v) eqs)
 
@@ -215,11 +237,56 @@ instance Pretty DataDecl where
       in "data " <> prettyL l tyCon <> " " <> tvs <> ki <> "where\n  " <> prettyL l dataConstrs
 
 instance Pretty [DataConstr] where
-    prettyL l = intercalate ";\n  " . map pretty
+    prettyL l = prettySemiSep 0
 
 instance Pretty DataConstr where
-    prettyL l (DataConstrIndexed _ name typeScheme) = prettyL l name <> " : " <> prettyL l typeScheme
-    prettyL l (DataConstrNonIndexed _ name params) = prettyL l name <> (unwords . map (prettyL l)) params
+    prettyL l (DataConstrIndexed _ name typeScheme) = prettyColonSep l name typeScheme
+    prettyL l (DataConstrNonIndexed _ name params) = unwords $ prettyL l name : map (prettyL (l+1)) params
+
+instance Pretty Interface where
+    prettyL l (Interface _ iName constrs params tys) =
+      concat ["interface ", constrStr, pretty iName, " ", pStr, sigStr]
+      where
+        constrStr =
+          case constrs of
+            [] -> ""
+            cs -> prettyConstraintsBraces cs
+        pStr = unwords $ fmap (\(paramName, kind) ->
+                           maybe (pretty paramName)
+                                 (parens' . prettyColonSep 0 paramName)
+                                 kind) params
+        sigStr = case tys of
+                   [] -> ""
+                   _  -> "where\n" <> tyStr
+        tyStr = "  " ++ prettySemiSep 0 tys
+
+instance Pretty InterfaceMethod where
+    prettyL l (InterfaceMethod _ name ty) = prettyColonSep l name ty
+
+instance (Pretty v) => Pretty (Instance v a) where
+    prettyL _ (Instance _ name cts idat defs) =
+      unwords ["instance", ctsStr <> pretty name,
+               pretty idat, defStr]
+      where ctsStr =
+              case cts of
+                [] -> ""
+                _ -> prettyConstraintsBraces cts
+            defStr =
+                case defs of
+                  [] -> ""
+                  _  -> "where\n  " <> prettySemiSep 0 defs
+
+instance Pretty InstanceTypes where
+    prettyL l (InstanceTypes _ ty) = unwords (fmap (prettyTy l) ty)
+
+
+instance (Pretty v) => Pretty (InstanceEquation v a) where
+    prettyL l (InstanceEquation _ v eq) = unwords [prettyL l v, prettyL l eq]
+
+
+instance (Pretty v) => Pretty (Equation v a) where
+    prettyL l (Equation _ _ ps e) = prettyL l ps <> "= " <> prettyL l e
+
 
 instance Pretty (Pattern a) where
     prettyL l (PVar _ _ v)     = prettyL l v
@@ -227,7 +294,9 @@ instance Pretty (Pattern a) where
     prettyL l (PBox _ _ p)     = "[" <> prettyL l p <> "]"
     prettyL l (PInt _ _ n)     = show n
     prettyL l (PFloat _ _ n)   = show n
-    prettyL l (PConstr _ _ name args)  = intercalate " " (prettyL l name : map (prettyL (l + 1)) args)
+    prettyL l (PConstr _ _ name args)  =
+        if null args then prettyL l name
+        else parens 1 $ unwords $ prettyL l name : map (prettyL (l + 1)) args
 
 instance {-# OVERLAPS #-} Pretty [Pattern a] where
     prettyL l [] = ""
@@ -238,7 +307,7 @@ instance Pretty t => Pretty (Maybe t) where
     prettyL l (Just x) = prettyL l x
 
 instance Pretty v => Pretty (Value v a) where
-    prettyL l (Abs _ x t e)  = parens l $ "\\(" <> prettyL l x <> " : " <> prettyL l t
+    prettyL l (Abs _ x t e)  = parens l $ "\\(" <> prettyColonSep l x t
                                <> ") -> " <> prettyL l e
     prettyL l (Promote _ e)  = "[" <> prettyL l e <> "]"
     prettyL l (Pure _ e)     = "<" <> prettyL l e <> ">"
@@ -299,8 +368,20 @@ instance Pretty Operator where
 parensOn :: (?globals :: Globals) => Pretty a => (a -> Bool) -> a -> String
 parensOn p t = prettyL (if p t then 0 else 1) t
 
+
+-- | Surround a string with curly braces
+braces :: String -> String
+braces x = "{" <> x <> "}"
+
+
+-- | Surround a string with parentheses
+parens' :: String -> String
+parens' x = if head x == '(' && last x == ')' then x else "(" <> x <> ")"
+
+
 ticks :: String -> String
 ticks x = "`" <> x <> "`"
+
 
 instance Pretty Int where
   prettyL l = show
@@ -315,3 +396,37 @@ instance Pretty Span where
 
 instance Pretty Pos where
     prettyL _ (l, c) = show l <> ":" <> show c
+
+
+-- | Pretty-print multiple items separated by lines and
+-- | semicolons, with indentation.
+prettySemiSep :: (?globals :: Globals) => (Pretty a) => Level -> [a] -> String
+prettySemiSep l = intercalate ";\n  " . map (prettyL l)
+
+
+-- | Pretty-print mulitple items separated by commas
+prettyCommaSep :: (?globals :: Globals) => (Pretty a) => Level -> [a] -> String
+prettyCommaSep l = intercalate ", " . map (prettyL l)
+
+
+-- | Pretty-print two items separated by a colon surrounded by
+-- | spaces
+prettyColonSep :: (?globals :: Globals) => (Pretty a, Pretty b) => Level -> a -> b -> String
+prettyColonSep l x y = prettyL l x <> " : " <> prettyL l y
+
+
+-- | Pretty-print some constraints
+-- |
+-- | The result includes a trailing space
+-- |
+-- | This variant uses curly braces
+prettyConstraintsBraces :: (?globals :: Globals) => [TConstraint] -> String
+prettyConstraintsBraces = (<> " => ") . braces . prettyCommaSep 0
+
+
+-- | Pretty-print a type (possibly surrounded by parentheses)
+-- |
+-- | E.g., 'a', 'Int', '(List a)'
+prettyTy :: (?globals :: Globals) => Level -> Type -> String
+prettyTy l ty@(TyApp _ _) = parens' $ prettyL l ty
+prettyTy l ty = prettyL l ty

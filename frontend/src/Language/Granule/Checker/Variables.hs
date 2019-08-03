@@ -5,6 +5,7 @@ module Language.Granule.Checker.Variables where
 import Control.Monad.State.Strict
 
 import qualified Data.Map as M
+import Data.Maybe (fromMaybe)
 
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.Predicates
@@ -19,25 +20,19 @@ freshIdentifierBase :: String -> Checker String
 freshIdentifierBase s = do
   checkerState <- get
   let vmap = uniqueVarIdCounterMap checkerState
-  let s' = takeWhile (\c -> c /= '`') s
-  case M.lookup s' vmap of
-    Nothing -> do
-      let vmap' = M.insert s' 1 vmap
-      put checkerState { uniqueVarIdCounterMap = vmap' }
-      return $ s' <> "." <> show 0
+      s' = takeWhile (\c -> c /= '`') s
+      counter = fromMaybe 0 $ M.lookup s' vmap
+      vmap' = M.insert s' (counter+1) vmap
+  put checkerState { uniqueVarIdCounterMap = vmap' }
+  pure $ s' <> "." <> show counter
 
-    Just n -> do
-      let vmap' = M.insert s' (n+1) vmap
-      put checkerState { uniqueVarIdCounterMap = vmap' }
-      return $ s' <> "." <> show n
-
--- | Helper for creating a few (existential) coeffect variable of a particular
+-- | Helper for creating a new (existential) coeffect variable of a particular
 --   coeffect type.
 freshTyVarInContext :: Id -> Kind -> Checker Id
 freshTyVarInContext cvar k = do
     freshTyVarInContextWithBinding cvar k InstanceQ
 
--- | Helper for creating a few (existential) coeffect variable of a particular
+-- | Helper for creating a new (existential) coeffect variable of a particular
 --   coeffect type.
 freshTyVarInContextWithBinding :: Id -> Kind -> Quantifier -> Checker Id
 freshTyVarInContextWithBinding var k q = do

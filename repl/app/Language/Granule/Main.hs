@@ -38,6 +38,8 @@ import Language.Granule.Checker.Checker
 import Language.Granule.Checker.Substitution
 import qualified Language.Granule.Checker.Primitives as Primitives
 import Language.Granule.Interpreter.Eval
+import Language.Granule.Interpreter.Type
+    (RValue, getCurrentContext, runWithContext, toRuntimeRep)
 import Language.Granule.Context
 --import qualified Language.Granule.Checker.Primitives as Primitives
 import qualified Control.Monad.Except as Ex
@@ -68,12 +70,12 @@ instance MonadException m => MonadException (Ex.ExceptT e m) where
                   in fmap Ex.runExceptT $ f run'
 
 replEval :: (?globals :: Globals) => Int -> AST () () -> IO (Maybe RValue)
-replEval val (AST dataDecls defs _) = do
-    bindings <- evalDefs builtIns (map toRuntimeRep defs)
+replEval val (AST dataDecls defs ifaces insts _) = do
+    bindings <- runWithContext builtIns (evalDefs (map toRuntimeRep defs) >> getCurrentContext)
     case lookup (mkId (" repl"<>(show val))) bindings of
       Nothing -> return Nothing
-      Just (Pure _ e)    -> fmap Just (evalIn bindings e)
-      Just (Promote _ e) -> fmap Just (evalIn bindings e)
+      Just (Pure _ e)    -> fmap Just (runWithContext bindings (evalExpr e))
+      Just (Promote _ e) -> fmap Just (runWithContext bindings (evalExpr e))
       Just val           -> return $ Just val
 
 liftIO' :: IO a -> REPLStateIO a
@@ -112,7 +114,8 @@ readToQueue pth = let ?globals = ?globals{ globalsSourceFilePath = Just pth } in
             checked <-  liftIO' $ check ast
             case checked of
                 Right _ -> do
-                    let (AST dd def _) = ast
+                    -- TODO: actually get decent interface/instance information to use here
+                    let (AST dd def _ _ _) = ast
                     forM def $ \idef -> loadInQueue idef
                     (fvg,rp,adt,f,m) <- get
                     put (fvg,rp,(dd<>adt),f,m)
@@ -369,7 +372,8 @@ handleCMD s =
             _ -> liftIO $ putStrLn xtx
         ast -> do
           -- TODO: use the type that comes out of the checker to return the type
-          checked <- liftIO' $ check (AST adt ast mempty)
+          -- TODO: actually get decent interface/instance information to use here
+          checked <- liftIO' $ check (AST adt ast [] [] mempty)
           case checked of
             Right _ -> liftIO $ putStrLn (printType trm m)
             Left err -> Ex.throwError (TypeCheckerError err)
@@ -386,7 +390,7 @@ handleCMD s =
                         case typ of
                             Right (t,a, _) -> return ()
                             Left err -> Ex.throwError (TypeCheckerError err)
-                        result <- liftIO' $ try $ evalIn builtIns (toRuntimeRep exp)
+                        result <- liftIO' $ try $ runWithContext builtIns $ evalExpr (toRuntimeRep exp)
                         case result of
                             Right r -> liftIO $ putStrLn (pretty r)
                             Left e -> Ex.throwError (EvalError e)
@@ -395,10 +399,12 @@ handleCMD s =
                         typer <- synTypeBuilder exp ast adt
                         let ndef = buildDef fvg (buildTypeScheme typer) exp
                         put ((fvg+1),rp,adt,fp,m)
-                        checked <- liftIO' $ check (AST adt (ast<>(ndef:[])) mempty)
+                        -- TODO: actually get decent interface/instance information to use here
+                        checked <- liftIO' $ check (AST adt (ast<>(ndef:[])) [] [] mempty)
                         case checked of
                             Right _ -> do
-                                result <- liftIO' $ try $ replEval fvg (AST adt (ast<>(ndef:[])) mempty)
+                                -- TODO: actually get decent interface/instance information to use here
+                                result <- liftIO' $ try $ replEval fvg (AST adt (ast<>(ndef:[])) [] [] mempty)
                                 case result of
                                     Left e -> Ex.throwError (EvalError e)
                                     Right Nothing -> liftIO $ print "if here fix"

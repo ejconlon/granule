@@ -53,6 +53,8 @@ library:
   - Language.Granule.Checker.SubstitutionContexts
   - Language.Granule.Checker.Substitution
   - Language.Granule.Checker.Types
+  - Language.Granule.Rewriter.Rewrite
+  - Language.Granule.Rewriter.Type
   - Language.Granule.Syntax.Def
   - Language.Granule.Syntax.Expr
   - Language.Granule.Syntax.Helpers

@@ -10,6 +10,7 @@ module Language.Granule.Checker.Kinds (
                     , inferCoeffectTypeInContext
                     , inferCoeffectTypeAssumption
                     , mguCoeffectTypes
+                    , getKindRequired
                     , promoteTypeToKind
                     , demoteKindToType
                     , isEffectType
@@ -19,6 +20,7 @@ module Language.Granule.Checker.Kinds (
 
 import Control.Monad.State.Strict
 
+import Language.Granule.Checker.Interface (interfaceExists, getInterfaceKind)
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.Predicates
 import Language.Granule.Checker.Primitives (tyOps, setElements)
@@ -39,17 +41,19 @@ inferKindOfType s t = do
     checkerState <- get
     inferKindOfTypeInContext s (stripQuantifiers $ tyVarContext checkerState) t
 
+
 inferKindOfTypeInContext :: (?globals :: Globals) => Span -> Ctxt Kind -> Type -> Checker Kind
 inferKindOfTypeInContext s quantifiedVariables t =
-    typeFoldM (TypeFold kFun kCon kBox kDiamond kVar kApp kInt kInfix kSet) t
+    typeFoldM (TypeFold kFun kCon kBox kDiamond kVar kApp kInt kInfix kSet kCoeffect) t
   where
+    illKindedNEq sp k1 k2 = throw $ KindMismatch{ errLoc = sp, tyActualK = Nothing, kExpected = k1, kActual = k2 }
     kFun (KPromote (TyCon c)) (KPromote (TyCon c'))
      | internalName c == internalName c' = return $ kConstr c
 
     kFun KType KType = return KType
     kFun KType (KPromote (TyCon (internalName -> "Protocol"))) = return $ KPromote (TyCon (mkId "Protocol"))
-    kFun KType y = throw KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = KType, kActual = y }
-    kFun x _     = throw KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = KType, kActual = x }
+    kFun KType y = illKindedNEq s KType y
+    kFun x _     = illKindedNEq s KType x
 
     kCon (internalName -> "Pure") = do
       -- Create a fresh type variable
@@ -68,7 +72,7 @@ inferKindOfTypeInContext s quantifiedVariables t =
        -- Infer the coeffect (fails if that is ill typed)
        _ <- inferCoeffectType s c
        return KType
-    kBox _ x = throw KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = KType, kActual = x }
+    kBox _ x = illKindedNEq s KType x
 
     kDiamond effK KType = do
       effTyM <- isEffectTypeFromKind s effK
@@ -76,16 +80,17 @@ inferKindOfTypeInContext s quantifiedVariables t =
         Right effTy -> return KType
         Left otherk  -> throw KindMismatch { errLoc = s, tyActualK = Just t, kExpected = KEffect, kActual = otherk }
 
-    kDiamond _ x     = throw KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = KType, kActual = x }
+    kDiamond _ x     = illKindedNEq s KType x
 
     kVar tyVar =
       case lookup tyVar quantifiedVariables of
-        Just kind -> return kind
+        Just kind -> pure kind
         Nothing   -> do
           st <- get
           case lookup tyVar (tyVarContext st) of
-            Just (kind, _) -> return kind
-            Nothing -> throw UnboundTypeVariable{ errLoc = s, errId = tyVar }
+            Just (kind, _) -> pure kind
+            Nothing ->
+              throw UnboundTypeVariable{ errLoc = s, errId = tyVar }
 
     kApp (KFun k1 k2) kArg | k1 `hasLub` kArg = return k2
     kApp k kArg = throw KindMismatch
@@ -95,13 +100,11 @@ inferKindOfTypeInContext s quantifiedVariables t =
         , kActual = k
         }
 
-    kInt _ = return $ kConstr $ mkId "Nat"
+    kInt _ = pure $ kConstr $ mkId "Nat"
 
     kInfix (tyOps -> (k1exp, k2exp, kret)) k1act k2act
-      | not (k1act `hasLub` k1exp) = throw
-        KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = k1exp, kActual = k1act}
-      | not (k2act `hasLub` k2exp) = throw
-        KindMismatch{ errLoc = s, tyActualK = Nothing, kExpected = k2exp, kActual = k2act}
+      | not (k1act `hasLub` k1exp) = illKindedNEq s k1exp k1act
+      | not (k2act `hasLub` k2exp) = illKindedNEq s k2exp k2act
       | otherwise                  = pure kret
 
     kSet ks =
@@ -134,8 +137,10 @@ inferKindOfTypeInContext s quantifiedVariables t =
                            Nothing -> throw $ KindCannotFormSet s (head ks)
 
             -- Find the first occurence of a change in kind:
-            else throw $ KindMismatch { errLoc = s , tyActualK = Nothing, kExpected = head left, kActual = head right }
+            else illKindedNEq s (head left) (head right)
                     where (left, right) = partition (\x -> (head ks) == x) ks
+
+    kCoeffect c = inferCoeffectType s c >>= pure . KPromote
 
 -- | Compute the join of two kinds, if it exists
 joinKind :: Kind -> Kind -> Maybe (Kind, Substitution)
@@ -272,6 +277,7 @@ checkKindIsCoeffect span ctxt ty = do
         _              -> throw KindMismatch{ errLoc = span, tyActualK = Just ty, kExpected = KCoeffect, kActual = kind }
 
     _ -> throw KindMismatch{ errLoc = span, tyActualK = Just ty, kExpected = KCoeffect, kActual = kind }
+
 
 -- Find the most general unifier of two coeffects
 -- This is an effectful operation which can update the coeffect-kind
@@ -419,3 +425,22 @@ isCoeffectKind KCoeffect = True
 isCoeffectKind (KUnion _ KCoeffect) = True
 isCoeffectKind (KUnion KCoeffect _) = True
 isCoeffectKind _ = False
+
+-- | Retrieve a kind from the type constructor scope
+getKindRequired :: (?globals :: Globals) => Span -> Id -> Checker Kind
+getKindRequired sp name = do
+  ifaceExists <- interfaceExists name
+  if ifaceExists
+  then getInterfaceKind sp name
+  else do
+    tyCon <- lookupContext typeConstructors name
+    case tyCon of
+      Just (kind, _) -> pure kind
+      Nothing -> do
+        dConTys <- maybe (throw UnboundTypeConstructor{ errLoc = sp, errId = name }) pure
+                   =<< lookupContext dataConstructors name
+        case dConTys of
+          (Forall _ [] [] t, []) -> pure $ KPromote t
+          _ -> throw NotImplemented{
+                            errLoc = sp
+                          , errDesc = "I'm afraid I can't yet promote the polymorphic data constructor:"  <> pretty name }

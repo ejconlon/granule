@@ -1,0 +1,8 @@
+data A a = A'
+
+interface Simple a
+
+-- duplicate instance for a (polymorphic) tyCon
+instance Simple (A a)
+
+instance Simple (A b)

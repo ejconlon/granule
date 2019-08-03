@@ -17,7 +17,6 @@ import Control.Arrow (first)
 import Control.Exception (assert)
 
 import Language.Granule.Checker.Predicates
-import Language.Granule.Checker.Kinds
 import Language.Granule.Context (Ctxt)
 
 import Language.Granule.Checker.Constraints.SymbolicGrades

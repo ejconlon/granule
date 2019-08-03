@@ -67,12 +67,12 @@ typeConstructors =
 
 tyOps :: TypeOperator -> (Kind, Kind, Kind)
 tyOps = \case
-    TyOpLesser -> (kNat, kNat, KPredicate)
-    TyOpLesserEq -> (kNat, kNat, KPredicate)
-    TyOpGreater -> (kNat, kNat, KPredicate)
-    TyOpGreaterEq -> (kNat, kNat, KPredicate)
-    TyOpEq -> (kNat, kNat, KPredicate)
-    TyOpNotEq -> (kNat, kNat, KPredicate)
+    TyOpLesser -> (kNat, kNat, (KConstraint Predicate))
+    TyOpLesserEq -> (kNat, kNat, (KConstraint Predicate))
+    TyOpGreater -> (kNat, kNat, (KConstraint Predicate))
+    TyOpGreaterEq -> (kNat, kNat, (KConstraint Predicate))
+    TyOpEq -> (kNat, kNat, (KConstraint Predicate))
+    TyOpNotEq -> (kNat, kNat, (KConstraint Predicate))
     TyOpPlus -> (kNat, kNat, kNat)
     TyOpTimes -> (kNat, kNat, kNat)
     TyOpMinus -> (kNat, kNat, kNat)
@@ -351,7 +351,7 @@ builtins :: [(Id, TypeScheme)]
 (builtinTypeConstructors, builtinDataConstructors, builtins) =
   (map fst datas, concatMap snd datas, map unDef defs)
     where
-      AST types defs _ = case parseDefs "builtins" builtinSrc of
+      AST types defs _ _ _ = case parseDefs "builtins" builtinSrc of
         Right ast -> ast
         Left err -> error err
       datas = map unData types

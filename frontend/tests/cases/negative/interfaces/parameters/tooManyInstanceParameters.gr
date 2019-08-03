@@ -1,0 +1,4 @@
+interface Simple a
+
+-- too many parameters to instance
+instance Simple a a

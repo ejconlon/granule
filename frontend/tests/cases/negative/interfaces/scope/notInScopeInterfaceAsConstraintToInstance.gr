@@ -1,0 +1,6 @@
+interface Simple a
+
+data SimpleDT a = SDT
+
+-- interface Simple1 is not in scope
+instance {Simple1 a} => Simple (SimpleDT a)

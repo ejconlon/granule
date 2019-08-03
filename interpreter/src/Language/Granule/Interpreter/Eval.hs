@@ -1,17 +1,13 @@
 -- Granule interpreter
 {-# LANGUAGE ImplicitParams #-}
-{-# LANGUAGE FlexibleContexts #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE TypeSynonymInstances #-}
-{-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ViewPatterns #-}
-
 
 {-# options_ghc -Wno-incomplete-uni-patterns #-}
 
 module Language.Granule.Interpreter.Eval where
 
 import Language.Granule.Interpreter.Desugar
+import Language.Granule.Interpreter.Type
 import Language.Granule.Syntax.Def
 import Language.Granule.Syntax.Expr
 import Language.Granule.Syntax.Identifiers
@@ -23,51 +19,19 @@ import Language.Granule.Utils
 
 import Data.Text (cons, pack, uncons, unpack, snoc, unsnoc)
 import qualified Data.Text.IO as Text
-import Control.Monad (when, foldM)
+import Control.Monad (when, zipWithM)
+import Control.Monad.IO.Class (liftIO)
 
 import qualified Control.Concurrent as C (forkIO)
-import qualified Control.Concurrent.Chan as CC (newChan, writeChan, readChan, Chan)
+import qualified Control.Concurrent.Chan as CC (newChan, writeChan, readChan)
 
-import System.IO (hFlush, stdout, stderr)
 import qualified System.IO as SIO
 
-type RValue = Value (Runtime ()) ()
-type RExpr = Expr (Runtime ()) ()
 
--- | Runtime values only used in the interpreter
-data Runtime a =
-  -- | Primitive functions (builtins)
-    Primitive ((Value (Runtime a) a) -> Value (Runtime a) a)
+------------------------------
+----- Bulk of evaluation -----
+------------------------------
 
-  -- | Primitive operations that also close over the context
-  | PrimitiveClosure (Ctxt (Value (Runtime a) a) -> (Value (Runtime a) a) -> (Value (Runtime a) a))
-
-  -- | File handler
-  | Handle SIO.Handle
-
-  -- | Channels
-  | Chan (CC.Chan (Value (Runtime a) a))
-
-  -- | Delayed side effects wrapper
-  | PureWrapper (IO (Expr (Runtime a) ()))
-
-diamondConstr :: IO (Expr (Runtime ()) ()) -> RValue
-diamondConstr = Ext () . PureWrapper
-
-isDiaConstr :: RValue -> Maybe (IO (Expr (Runtime ()) ()))
-isDiaConstr (Pure _ e) = Just $ return e
-isDiaConstr (Ext _ (PureWrapper e)) = Just e
-isDiaConstr _ = Nothing
-
-instance Show (Runtime a) where
-  show (Chan _) = "Some channel"
-  show (Primitive _) = "Some primitive"
-  show (PrimitiveClosure _) = "Some primitive closure"
-  show (Handle _) = "Some handle"
-  show (PureWrapper _) = "<suspended IO>"
-
-instance Pretty (Runtime a) where
-  prettyL _ = show
 
 evalBinOp :: Operator -> RValue -> RValue -> RValue
 evalBinOp op v1 v2 = case op of
@@ -110,52 +74,76 @@ evalBinOp op v1 v2 = case op of
   where
     evalFail = error $ show [show op, show v1, show v2]
 
+
 -- Call-by-value big step semantics
-evalIn :: (?globals :: Globals) => Ctxt RValue -> RExpr -> IO RValue
-evalIn ctxt (App s _ e1 e2) = do
-    -- (cf. APP_L)
-    v1 <- evalIn ctxt e1
+evalExpr :: (?globals :: Globals) => RExpr -> Evaluator RValue
+
+evalExpr (Val s _ (Var _ v)) | internalName v == "read" = do
+    writeStr "> "
+    flushStdout
+    val <- liftIO Text.getLine
+    return $ Pure () (Val s () (StringLiteral val))
+
+evalExpr (Val s _ (Var _ v)) | internalName v == "readInt" = do
+    writeStr "> "
+    flushStdout
+    val <- liftIO readLn
+    return $ Pure () (Val s () (NumInt val))
+
+evalExpr (Val s _ (Var _ v)) | internalName v == "fromStdin" = do
+    when testing (error "trying to read `fromStdin` while testing")
+    writeStr "> "
+    flushStdout
+    val <- liftIO Text.getLine
+    return $ Pure () (Val s () (StringLiteral val))
+
+-- evalExpr _ (Val s _ (Var _ v)) | internalName v == "readInt" = do
+--     when testing (error "trying to `readInt` while testing")
+--     writeStr "> "
+--     flushStdout
+--     val <- liftIO readLn
+--     return $ Pure () (Val s () (NumInt val))
+
+evalExpr (Val _ _ (Abs _ p t e)) = return $ Abs () p t e
+
+evalExpr (App s _ e1 e2) = do
+    v1 <- evalExpr e1
     case v1 of
       (Ext _ (Primitive k)) -> do
-        -- (cf. APP_R)
-        v2 <- evalIn ctxt e2
-        return $ k v2
+        v2 <- evalExpr e2
+        runPrimitive k v2
 
       Abs _ p _ e3 -> do
-        -- (cf. APP_R)
-        v2 <- evalIn ctxt e2
-        -- (cf. P_BETA)
-        pResult <- pmatch ctxt [(p, e3)] v2
-        case pResult of
-          Just e3' -> evalIn ctxt e3'
+        p <- pmatchTop [(p, e3)] e2
+        case p of
+          Just (e3, bindings) -> evalExpr (applyBindings bindings e3)
           _ -> error $ "Runtime exception: Failed pattern match " <> pretty p <> " in application at " <> pretty s
 
       Constr _ c vs -> do
-        -- (cf. APP_R)
-        v2 <- evalIn ctxt e2
+        v2 <- evalExpr e2
         return $ Constr () c (vs <> [v2])
 
       _ -> error $ show v1
       -- _ -> error "Cannot apply value"
 
-evalIn ctxt (Binop _ _ op e1 e2) = do
-     v1 <- evalIn ctxt e1
-     v2 <- evalIn ctxt e2
+evalExpr (Binop _ _ op e1 e2) = do
+     v1 <- evalExpr e1
+     v2 <- evalExpr e2
      return $ evalBinOp op v1 v2
 
-evalIn ctxt (LetDiamond s _ p _ e1 e2) = do
+evalExpr (LetDiamond s _ p _ e1 e2) = do
   -- (cf. LET_1)
-  v1 <- evalIn ctxt e1
+  v1 <- evalExpr e1
   case v1 of
     (isDiaConstr -> Just e) -> do
         -- Do the delayed side effect
-        eInner <- e
+        eInner <- liftIO e
         -- (cf. LET_2)
-        v1' <- evalIn ctxt eInner
+        v1' <- evalExpr eInner
         -- (cf. LET_BETA)
-        pResult  <- pmatch ctxt [(p, e2)] v1'
-        case pResult of
-          Just e2' -> evalIn ctxt e2'
+        p  <- pmatch [(p, e2)] v1'
+        case p of
+          Just (e2, bindings) -> evalExpr (applyBindings bindings e2)
           Nothing -> error $ "Runtime exception: Failed pattern match " <> pretty p <> " in let at " <> pretty s
 
     other -> fail $ "Runtime exception: Expecting a diamonad value but got: "
@@ -163,7 +151,9 @@ evalIn ctxt (LetDiamond s _ p _ e1 e2) = do
 
 {-
 -- Hard-coded 'scale', removed for now
-evalIn _ (Val _ (Var v)) | internalName v == "scale" = return
+
+
+evalExpr (Val _ (Var v)) | internalName v == "scale" = return
   (Abs (PVar nullSpan $ mkId " x") Nothing (Val nullSpan
     (Abs (PVar nullSpan $ mkId " y") Nothing (
       letBox nullSpan (PVar nullSpan $ mkId " ye")
@@ -172,29 +162,30 @@ evalIn _ (Val _ (Var v)) | internalName v == "scale" = return
            "*" (Val nullSpan (Var (mkId " x"))) (Val nullSpan (Var (mkId " ye"))))))))
 -}
 
-evalIn ctxt (Val _ _ (Var _ x)) =
-    case lookup x ctxt of
-      Just val@(Ext _ (PrimitiveClosure f)) -> return $ Ext () $ Primitive (f ctxt)
+evalExpr (Val _ _ (Var _ x)) = do
+  maybeVal <- tryResolveVarOrEvalTLD x
+  case maybeVal of
+      Just val@(Ext _ (PrimitiveClosure f)) ->
+        fmap (Ext () . Primitive . f) getCurrentContext
       Just val -> return val
       Nothing  -> fail $ "Variable '" <> sourceName x <> "' is undefined in context."
 
-evalIn ctxt (Val s _ (Promote _ e)) = do
+evalExpr (Val s _ (Promote _ e)) = do
   -- (cf. Box)
-  v <- evalIn ctxt e
+  v <- evalExpr e
   return $ Promote () (Val s () v)
 
-evalIn _ (Val _ _ v) = return v
+evalExpr (Val _ _ v) = return v
 
-evalIn ctxt (Case _ _ guardExpr cases) = do
-    v <- evalIn ctxt guardExpr
-    p <- pmatch ctxt cases v
+evalExpr (Case _ _ guardExpr cases) = do
+    p <- pmatchTop cases guardExpr
     case p of
-      Just ei -> evalIn ctxt ei
+      Just (ei, bindings) -> evalExpr (applyBindings bindings ei)
       Nothing             ->
         error $ "Incomplete pattern match:\n  cases: "
-             <> pretty cases <> "\n  expr: " <> pretty v
+             <> pretty cases <> "\n  expr: " <> pretty guardExpr
 
-evalIn ctxt (Hole _ _) = do
+evalExpr (Hole _ _) = do
   error "Trying to evaluate a hole, which should not have passed the type checker."
 
 applyBindings :: Ctxt RExpr -> RExpr -> RExpr
@@ -205,45 +196,58 @@ applyBindings ((var, e'):bs) e = applyBindings bs (subst e' var e)
     a list of cases (pattern-expression pairs) and the guard expression.
     If there is a matching pattern p_i then return Just of the branch
     expression e_i and a list of bindings in scope -}
+pmatchTop ::
+  (?globals :: Globals)
+  => [(Pattern (), RExpr)]
+  -> RExpr
+  -> Evaluator (Maybe (RExpr, Ctxt RExpr))
+
+pmatchTop ((PBox _ _ (PVar _ _ var), branchExpr):_) guardExpr = do
+  Promote _ e <- evalExpr guardExpr
+  return (Just (subst e var branchExpr, []))
+
+pmatchTop ((PBox _ _ (PWild _ _), branchExpr):_) guardExpr = do
+  Promote _ _ <- evalExpr guardExpr
+  return (Just (branchExpr, []))
+
+pmatchTop ps guardExpr = do
+  val <- evalExpr guardExpr
+  pmatch ps val
+
 pmatch ::
   (?globals :: Globals)
-  => Ctxt RValue
-  -> [(Pattern (), RExpr)]
+  => [(Pattern (), RExpr)]
   -> RValue
-  -> IO (Maybe RExpr)
-pmatch _ [] _ =
-  return Nothing
+  -> Evaluator (Maybe (RExpr, Ctxt RExpr))
+pmatch [] _ =
+   return Nothing
 
-pmatch _ ((PWild _ _, e):_)  _ =
-  return $ Just e
+pmatch ((PWild _ _, e):_)  _ =
+   return $ Just (e, [])
 
-pmatch ctxt ((PConstr _ _ id innerPs, t0):ps) v@(Constr _ id' vs)
- | id == id' && length innerPs == length vs = do
+pmatch ((PConstr _ _ s innerPs, e):ps) (Constr _ s' vs) | s == s' = do
+   matches <- zipWithM (\p v -> pmatch [(p, e)] v) innerPs vs
+   case sequence matches of
+     Just ebindings -> return $ Just (e, concat $ map snd ebindings)
+     Nothing        -> pmatch ps (Constr () s' vs)
 
-  -- Fold over the inner patterns
-  tLastM <- foldM (\tiM (pi, vi) -> case tiM of
-                                      Nothing -> return Nothing
-                                      Just ti -> pmatch ctxt [(pi, ti)] vi) (Just t0) (zip innerPs vs)
+pmatch ((PVar _ _ var, e):_) val =
+   return $ Just (e, [(var, Val nullSpan () val)])
 
-  case tLastM of
-    Just tLast -> return $ Just tLast
-    -- There was a failure somewhere
-    Nothing  -> pmatch ctxt ps v
-
-pmatch _ ((PVar _ _ var, e):_) v =
-  return $ Just $ subst (Val nullSpan () v) var e
-
-pmatch ctxt ((PBox _ _ p, e):ps) v@(Promote _ (Val _ _ v')) = do
-  match <- pmatch ctxt [(p, e)] v'
+pmatch ((PBox _ _ p, e):ps) (Promote _ e') = do
+  v <- evalExpr e'
+  match <- pmatch [(p, e)] v
   case match of
-    Just e -> return $ Just e
-    Nothing -> pmatch ctxt ps v
+    Just (_, bindings) -> return $ Just (e, bindings)
+    Nothing -> pmatch ps (Promote () e')
 
-pmatch ctxt ((PInt _ _ n, e):ps) (NumInt m) | n == m = return $ Just e
+pmatch ((PInt _ _ n, e):_)   (NumInt m)   | n == m  =
+   return $ Just (e, [])
 
-pmatch ctxt ((PFloat _ _ n, e):ps) (NumFloat m )| n == m = return $ Just e
+pmatch ((PFloat _ _ n, e):_) (NumFloat m) | n == m =
+   return $ Just (e, [])
 
-pmatch ctxt (_:ps) v = pmatch ctxt ps v
+pmatch (_:ps) val = pmatch ps val
 
 valExpr :: ExprFix2 g ExprF ev () -> ExprFix2 ExprF g ev ()
 valExpr = Val nullSpanNoFile ()
@@ -252,101 +256,101 @@ builtIns :: (?globals :: Globals) => Ctxt RValue
 builtIns =
   [
     (mkId "div", Ext () $ Primitive $ \(NumInt n1)
-          -> Ext () $ Primitive $ \(NumInt n2) -> NumInt (n1 `div` n2))
-  , (mkId "pure",       Ext () $ Primitive $ \v -> Pure () (Val nullSpan () v))
+          -> pure $ Ext () $ Primitive $ \(NumInt n2) -> pure $ NumInt (n1 `div` n2))
+  , (mkId "pure",       Ext () $ Primitive $ \v -> pure $ Pure () (Val nullSpan () v))
   , (mkId "tick",       Pure () (Val nullSpan () (Constr () (mkId "()") [])))
-  , (mkId "intToFloat", Ext () $ Primitive $ \(NumInt n) -> NumFloat (cast n))
+  , (mkId "intToFloat", Ext () $ Primitive $ \(NumInt n) -> pure $ NumFloat (cast n))
   , (mkId "showInt",    Ext () $ Primitive $ \n -> case n of
-                              NumInt n -> StringLiteral . pack . show $ n
+                              NumInt n -> pure $ StringLiteral . pack . show $ n
                               n        -> error $ show n)
   , (mkId "fromStdin", diamondConstr $ do
       when testing (error "trying to read stdin while testing")
       putStr "> "
-      hFlush stdout
+      SIO.hFlush SIO.stdout
       val <- Text.getLine
       return $ Val nullSpan () (StringLiteral val))
 
   , (mkId "readInt", diamondConstr $ do
         when testing (error "trying to read stdin while testing")
         putStr "> "
-        hFlush stdout
+        SIO.hFlush SIO.stdout
         val <- Text.getLine
         return $ Val nullSpan () (NumInt $ read $ unpack val))
 
   , (mkId "toStdout", Ext () $ Primitive $ \(StringLiteral s) ->
-                                diamondConstr (do
+                                pure $ diamondConstr (do
                                   when testing (error "trying to write `toStdout` while testing")
                                   Text.putStr s
                                   return $ (Val nullSpan () (Constr () (mkId "()") []))))
   , (mkId "toStderr", Ext () $ Primitive $ \(StringLiteral s) ->
-                                diamondConstr (do
+                                pure $ diamondConstr (do
                                   when testing (error "trying to write `toStderr` while testing")
                                   let red x = "\ESC[31;1m" <> x <> "\ESC[0m"
-                                  Text.hPutStr stderr $ red s
+                                  Text.hPutStr SIO.stderr $ red s
                                   return $ Val nullSpan () (Constr () (mkId "()") [])))
-  , (mkId "openHandle", Ext () $ Primitive openHandle)
-  , (mkId "readChar", Ext () $ Primitive readChar)
-  , (mkId "writeChar", Ext () $ Primitive writeChar)
-  , (mkId "closeHandle",   Ext () $ Primitive closeHandle)
+  , (mkId "openHandle", Ext () $ Primitive $ pure . openHandle)
+  , (mkId "readChar", Ext () $ Primitive $ pure . readChar)
+  , (mkId "writeChar", Ext () $ Primitive $ pure . writeChar)
+  , (mkId "closeHandle",   Ext () $ Primitive $ pure . closeHandle)
   , (mkId "showChar",
-        Ext () $ Primitive $ \(CharLiteral c) -> StringLiteral $ pack [c])
+        Ext () $ Primitive $ \(CharLiteral c) -> pure $ StringLiteral $ pack [c])
   , (mkId "charToInt",
-        Ext () $ Primitive $ \(CharLiteral c) -> NumInt $ fromEnum c)
+        Ext () $ Primitive $ \(CharLiteral c) -> pure $ NumInt $ fromEnum c)
   , (mkId "charFromInt",
-        Ext () $ Primitive $ \(NumInt c) -> CharLiteral $ toEnum c)
+        Ext () $ Primitive $ \(NumInt c) -> pure $ CharLiteral $ toEnum c)
   , (mkId "stringAppend",
         Ext () $ Primitive $ \(StringLiteral s) ->
-          Ext () $ Primitive $ \(StringLiteral t) -> StringLiteral $ s <> t)
+          pure $ Ext () $ Primitive $ \(StringLiteral t) -> pure $ StringLiteral $ s <> t)
   , ( mkId "stringUncons"
     , Ext () $ Primitive $ \(StringLiteral s) -> case uncons s of
-        Just (c, s) -> Constr () (mkId "Some") [Constr () (mkId ",") [CharLiteral c, StringLiteral s]]
-        Nothing     -> Constr () (mkId "None") []
+        Just (c, s) -> pure $ Constr () (mkId "Some") [Constr () (mkId ",") [CharLiteral c, StringLiteral s]]
+        Nothing     -> pure $ Constr () (mkId "None") []
     )
   , ( mkId "stringCons"
     , Ext () $ Primitive $ \(CharLiteral c) ->
-        Ext () $ Primitive $ \(StringLiteral s) -> StringLiteral (cons c s)
+        pure $ Ext () $ Primitive $ \(StringLiteral s) -> pure $ StringLiteral (cons c s)
     )
   , ( mkId "stringUnsnoc"
     , Ext () $ Primitive $ \(StringLiteral s) -> case unsnoc s of
-        Just (s, c) -> Constr () (mkId "Some") [Constr () (mkId ",") [StringLiteral s, CharLiteral c]]
-        Nothing     -> Constr () (mkId "None") []
+        Just (s, c) -> pure $ Constr () (mkId "Some") [Constr () (mkId ",") [StringLiteral s, CharLiteral c]]
+        Nothing     -> pure $ Constr () (mkId "None") []
     )
   , ( mkId "stringSnoc"
     , Ext () $ Primitive $ \(StringLiteral s) ->
-        Ext () $ Primitive $ \(CharLiteral c) -> StringLiteral (snoc s c)
+        pure $ Ext () $ Primitive $ \(CharLiteral c) -> pure $ StringLiteral (snoc s c)
     )
-  , (mkId "isEOF", Ext () $ Primitive $ \(Ext _ (Handle h)) -> Ext () $ PureWrapper $ do
+  , (mkId "isEOF", Ext () $ Primitive $ \(Ext _ (Handle h)) -> pure $ Ext () $ PureWrapper $ do
         b <- SIO.isEOF
         let boolflag =
              case b of
                True -> Constr () (mkId "True") []
                False -> Constr () (mkId "False") []
         return . Val nullSpan () $ Constr () (mkId ",") [Ext () $ Handle h, boolflag])
-  , (mkId "forkLinear", Ext () $ PrimitiveClosure fork)
-  , (mkId "forkRep", Ext () $ PrimitiveClosure forkRep)
-  , (mkId "fork",    Ext () $ PrimitiveClosure forkRep)
-  , (mkId "recv",    Ext () $ Primitive recv)
-  , (mkId "send",    Ext () $ Primitive send)
-  , (mkId "close",   Ext () $ Primitive close)
+  , (mkId "forkLinear", Ext () $ PrimitiveClosure $ fork)
+  , (mkId "forkRep", Ext () $ PrimitiveClosure $ forkRep)
+  , (mkId "fork",    Ext () $ PrimitiveClosure $ forkRep)
+  , (mkId "recv",    Ext () $ Primitive $ pure . recv)
+  , (mkId "send",    Ext () $ Primitive $ pure . send)
+  , (mkId "close",   Ext () $ Primitive $ pure . close)
   ]
   where
-    fork :: (?globals :: Globals) => Ctxt RValue -> RValue -> RValue
-    fork ctxt e@Abs{} = diamondConstr $ do
+    fork :: (?globals :: Globals) => Ctxt RValue -> RValue -> IO RValue
+    fork ctxt e@Abs{} = pure $ diamondConstr $ do
       c <- CC.newChan
       _ <- C.forkIO $
-         evalIn ctxt (App nullSpan () (valExpr e) (valExpr $ Ext () $ Chan c)) >> return ()
+         runWithContext ctxt $ evalExpr (App nullSpan () (valExpr e) (valExpr $ Ext () $ Chan c)) >> pure ()
       return $ valExpr $ Ext () $ Chan c
-    fork ctxt e = error $ "Bug in Granule. Trying to fork: " <> prettyDebug e
+    fork _ e = error $ "Bug in Granule. Trying to fork: " <> prettyDebug e
 
-    forkRep :: (?globals :: Globals) => Ctxt RValue -> RValue -> RValue
-    forkRep ctxt e@Abs{} = diamondConstr $ do
+    forkRep :: (?globals :: Globals) => Ctxt RValue -> RValue -> IO RValue
+    forkRep ctxt e@Abs{} = pure $ diamondConstr $ do
       c <- CC.newChan
-      _ <- C.forkIO $
-         evalIn ctxt (App nullSpan ()
+      _ <- C.forkIO $ runWithContext ctxt $
+         evalExpr (App nullSpan ()
                         (valExpr e)
                         (valExpr $ Promote () $ valExpr $ Ext () $ Chan c)) >> return ()
       return $ valExpr $ Promote () $ valExpr $ Ext () $ Chan c
-    forkRep ctxt e = error $ "Bug in Granule. Trying to fork: " <> prettyDebug e
+    forkRep _ e = error $ "Bug in Granule. Trying to fork: " <> prettyDebug e
 
     recv :: (?globals :: Globals) => RValue -> RValue
     recv (Ext _ (Chan c)) = diamondConstr $ do
@@ -356,7 +360,7 @@ builtIns =
 
     send :: (?globals :: Globals) => RValue -> RValue
     send (Ext _ (Chan c)) = Ext () $ Primitive
-      (\v -> diamondConstr $ do
+      (\v -> pure $ diamondConstr $ do
          CC.writeChan c v
          return $ valExpr $ Ext () $ Chan c)
     send e = error $ "Bug in Granule. Trying to send from: " <> prettyDebug e
@@ -370,7 +374,7 @@ builtIns =
 
     openHandle :: RValue -> RValue
     openHandle (Constr _ m []) =
-      Ext () $ Primitive (\x -> diamondConstr (
+      Ext () $ Primitive (\x -> pure $ diamondConstr (
         case x of
           (StringLiteral s) -> do
             h <- SIO.openFile (unpack s) mode
@@ -388,7 +392,7 @@ builtIns =
 
     writeChar :: RValue -> RValue
     writeChar (Ext _ (Handle h)) =
-      Ext () $ Primitive (\c -> diamondConstr (
+      Ext () $ Primitive (\c -> pure $ diamondConstr (
         case c of
           (CharLiteral c) -> do
             SIO.hPutChar h c
@@ -408,58 +412,53 @@ builtIns =
          return $ valExpr (Constr () (mkId "()") [])
     closeHandle _ = error $ "Runtime exception: trying to close a non handle value"
 
-evalDefs :: (?globals :: Globals) => Ctxt RValue -> [Def (Runtime ()) ()] -> IO (Ctxt RValue)
-evalDefs ctxt [] = return ctxt
-evalDefs ctxt (Def _ var [Equation _ _ [] e] _ : defs) = do
-    val <- evalIn ctxt e
-    case extend ctxt var val of
-      Just ctxt -> evalDefs ctxt defs
-      Nothing -> error $ "Name clash: `" <> sourceName var <> "` was already in the context."
-evalDefs ctxt (d : defs) = do
-    let d' = desugar d
-    evalDefs ctxt (d' : defs)
+evalDefs :: (?globals :: Globals) => [Def (Runtime ()) ()] -> Evaluator ()
+evalDefs defs = do
+  let desugared = fmap desugarDef defs
+  buildDefMap desugared
+  mapM_ evalDef desugared
+  where desugarDef def@(Def _ _ [Equation _ _ [] _] _) = def
+        desugarDef def = desugar def
 
--- Maps an AST from the parser into the interpreter version with runtime values
-class RuntimeRep t where
-  toRuntimeRep :: t () () -> t (Runtime ()) ()
 
-instance RuntimeRep Def where
-  toRuntimeRep (Def s i eqs tys) = Def s i (map toRuntimeRep eqs) tys
+evalDef :: (?globals :: Globals) => Def (Runtime ()) () -> Evaluator RValue
+evalDef (Def _ var [Equation _ _ [] e] _) = do
+  existing <- lookupInCurrentContext var
+  case existing of
+    -- we've already evaluated this definition
+    Just v -> pure v
+    Nothing -> do
+      val <- evalExpr e
+      ctxt <- getCurrentContext
+      case extend ctxt var val of
+        Just ctxt' -> putContext ctxt' >> pure val
+        Nothing -> error $ "could not extend context in definition evaluation"
+evalDef _ = fail "received a non-desugared definition in evaluation"
 
-instance RuntimeRep Equation where
-  toRuntimeRep (Equation s a ps e) = Equation s a ps (toRuntimeRep e)
 
-instance RuntimeRep Expr where
-  toRuntimeRep (Val s a v) = Val s a (toRuntimeRep v)
-  toRuntimeRep (App s a e1 e2) = App s a (toRuntimeRep e1) (toRuntimeRep e2)
-  toRuntimeRep (Binop s a o e1 e2) = Binop s a o (toRuntimeRep e1) (toRuntimeRep e2)
-  toRuntimeRep (LetDiamond s a p t e1 e2) = LetDiamond s a p t (toRuntimeRep e1) (toRuntimeRep e2)
-  toRuntimeRep (Case s a e ps) = Case s a (toRuntimeRep e) (map (\(p, e) -> (p, toRuntimeRep e)) ps)
-  toRuntimeRep (Hole s a) = Hole s a
+tryResolveVarOrEvalTLD :: (?globals :: Globals) => Id -> Evaluator (Maybe RValue)
+tryResolveVarOrEvalTLD n = do
+  maybeVal <- lookupInCurrentContext n
+  case maybeVal of
+    Just v -> pure . pure $ v
+    Nothing -> do
+      -- if we can't find an already-evaluated name, then
+      -- try and find a TLD with the given name, and evaluate it
+      def <- lookupInDefMap n
+      maybe (pure Nothing) (fmap Just . evalDef) def
 
-instance RuntimeRep Value where
-  toRuntimeRep (Ext a ()) = error "Bug: Parser generated an extended value case when it shouldn't have"
-  toRuntimeRep (Abs a p t e) = Abs a p t (toRuntimeRep e)
-  toRuntimeRep (Promote a e) = Promote a (toRuntimeRep e)
-  toRuntimeRep (Pure a e) = Pure a (toRuntimeRep e)
-  toRuntimeRep (Constr a i vs) = Constr a i (map toRuntimeRep vs)
-  -- identity cases
-  toRuntimeRep (CharLiteral c) = CharLiteral c
-  toRuntimeRep (StringLiteral c) = StringLiteral c
-  toRuntimeRep (Var a x) = Var a x
-  toRuntimeRep (NumInt x) = NumInt x
-  toRuntimeRep (NumFloat x) = NumFloat x
 
 eval :: (?globals :: Globals) => AST () () -> IO (Maybe RValue)
-eval (AST dataDecls defs _) = do
-    bindings <- evalDefs builtIns (map toRuntimeRep defs)
+eval (AST dataDecls defs ifaces insts _) = execEvaluator (do
+    evalDefs (map toRuntimeRep defs)
+    bindings <- getCurrentContext
     case lookup (mkId entryPoint) bindings of
       Nothing -> return Nothing
       -- Evaluate inside a promotion of pure if its at the top-level
-      Just (Pure _ e)    -> fmap Just (evalIn bindings e)
+      Just (Pure _ e)    -> fmap Just (evalExpr e)
       Just (Ext _ (PureWrapper e)) -> do
-        eExpr <- e
-        fmap Just (evalIn bindings eExpr)
-      Just (Promote _ e) -> fmap Just (evalIn bindings e)
+        eExpr <- liftIO e
+        fmap Just (evalExpr eExpr)
+      Just (Promote _ e) -> fmap Just (evalExpr e)
       -- ... or a regular value came out of the interpreter
-      Just val           -> return $ Just val
+      Just val           -> return $ Just val) (initStateWithContext builtIns)

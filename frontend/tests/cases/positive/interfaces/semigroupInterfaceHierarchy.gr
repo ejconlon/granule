@@ -1,0 +1,11 @@
+data List a = Nil | Cons a (List a)
+
+interface Semigroup b where
+  op : b -> b -> b
+
+interface {Semigroup c} => Monoid c where
+  unit : c
+
+mconcat : forall {d : Type} . {Monoid d} => (List d) -> d
+mconcat Nil = unit;
+mconcat (Cons x xs) = op x (mconcat xs)

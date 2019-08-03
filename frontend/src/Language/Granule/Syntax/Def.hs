@@ -24,9 +24,9 @@ import Language.Granule.Syntax.Pattern
 -- | Comprise a list of data type declarations and a list
 -- | of expression definitions
 -- | where `v` is the type of values and `a` annotations
-data AST v a = AST [DataDecl] [Def v a] (Set Import)
-deriving instance (Show (Def v a), Show a) => Show (AST v a)
-deriving instance (Eq (Def v a), Eq a) => Eq (AST v a)
+data AST v a = AST [DataDecl] [Def v a] [Interface] [Instance v a] (Set Import)
+deriving instance (Show v, Show a) => Show (AST v a)
+deriving instance (Eq v, Eq a) => Eq (AST v a)
 
 type Import = FilePath
 
@@ -94,11 +94,69 @@ instance FirstParameter DataConstr Span
 -- | How many data constructors a type has (Nothing -> don't know)
 type Cardinality = Maybe Nat
 
+
+-- | Interfaces.
+data Interface =
+  Interface
+  Span
+  Id           -- ^ interface name
+  [TConstraint] -- ^ constraints
+  [(Id, Maybe Kind)] -- ^ parameters
+  [InterfaceMethod]
+  deriving (Show, Eq)
+
+
+interfaceId :: Interface -> Id
+interfaceId (Interface _ n _ _ _) = n
+
+
+interfaceSpan :: Interface -> Span
+interfaceSpan (Interface sp _ _ _ _) = sp
+
+
+-- | Interface methods (method type signatures).
+data InterfaceMethod = InterfaceMethod Span Id TypeScheme
+  deriving (Generic, Show, Eq)
+
+instance FirstParameter InterfaceMethod Span
+
+
+-- | Instances.
+data Instance v a =
+  Instance
+  Span
+  Id         -- ^ interface name
+  [TConstraint] -- ^ constraints
+  InstanceTypes   -- ^ instance type
+  [InstanceEquation v a] -- ^ implementations
+
+deriving instance (Eq v, Eq a) => Eq (Instance v a)
+deriving instance (Show v, Show a) => Show (Instance v a)
+
+-- | A single equation in an instance.
+data InstanceEquation v a = InstanceEquation Span (Maybe Id) (Equation v a)
+  deriving (Generic)
+
+instance FirstParameter (InstanceEquation v a) Span
+deriving instance (Eq v, Eq a) => Eq (InstanceEquation v a)
+deriving instance (Show v, Show a) => Show (InstanceEquation v a)
+
+
+-- | The parameters of an instance.
+data InstanceTypes = InstanceTypes Span [Type]
+  deriving (Show, Generic, Eq)
+
+instance FirstParameter InstanceTypes Span
+
+
 -- | Fresh a whole AST
 freshenAST :: AST v a -> AST v a
-freshenAST (AST dds defs imports) =
-  AST dds' defs' imports
-    where (dds', defs') = (map runFreshener dds, map runFreshener defs)
+freshenAST (AST dds defs ifaces insts imports) =
+  AST dds' defs' ifaces' insts' imports
+    where dds' = map runFreshener dds
+          defs' = map runFreshener defs
+          ifaces' = map runFreshener ifaces
+          insts' = map runFreshener insts
 
 instance Monad m => Freshenable m DataDecl where
   freshen (DataDecl s v tyVars kind ds) = do
@@ -114,6 +172,37 @@ instance Monad m => Freshenable m DataConstr where
   freshen (DataConstrNonIndexed sp v ts) = do
     ts <- mapM freshen ts
     return $ DataConstrNonIndexed sp v ts
+
+instance Monad m => Freshenable m Interface where
+  freshen (Interface sp iname constrs params itys) = do
+    params' <- mapM (both (freshIdentifierBase Type) freshen) params
+    constrs' <- mapM freshen constrs
+    itys' <- mapM freshen itys
+    return $ Interface sp iname constrs' params' itys'
+    where both x y (z1,z2) = x z1 >>= (\z1' -> fmap ((,) z1') (y z2))
+
+instance Monad m => Freshenable m InterfaceMethod where
+  freshen (InterfaceMethod sp name tys) = do
+    tys' <- freshen tys
+    return $ InterfaceMethod sp name tys'
+
+instance Monad m => Freshenable m (Instance v a) where
+  freshen (Instance sp name constrs idat defs) = do
+    idat' <- freshen idat
+    constrs' <- mapM freshen constrs
+    defs' <- mapM freshen defs
+    return $ Instance sp name constrs' idat' defs'
+
+instance Monad m => Freshenable m (InstanceEquation v a) where
+  freshen (InstanceEquation sp name eqn) = do
+    eqn' <- freshen eqn
+    return $ InstanceEquation sp name eqn'
+
+instance Monad m => Freshenable m InstanceTypes where
+  freshen (InstanceTypes sp tys) = do
+    mapM_ (freshIdentifierBase Type) (concatMap freeVars tys)
+    tys' <- freshen tys
+    return $ InstanceTypes sp tys'
 
 instance Monad m => Freshenable m (Equation v a) where
   freshen (Equation s a ps e) = do

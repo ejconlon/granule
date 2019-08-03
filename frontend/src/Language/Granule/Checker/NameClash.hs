@@ -9,22 +9,24 @@ import Language.Granule.Utils
 
 -- | Check if there are name clashes within namespaces
 checkNameClashes :: AST () () -> Checker ()
-checkNameClashes (AST dataDecls defs _) =
+checkNameClashes (AST dataDecls defs ifaces _ _) =
     case concat [typeConstructorErrs, dataConstructorErrs, defErrs] of
       [] -> pure ()
       (d:ds) -> throwError (d:|ds)
   where
     typeConstructorErrs
       = fmap mkTypeConstructorErr
-      . duplicatesBy (sourceName . dataDeclId)
-      $ dataDecls
+      . duplicatesBy (sourceName . tyConId)
+      $ fmap Right dataDecls <> fmap Left ifaces
+      where tyConId = either interfaceId dataDeclId
 
     mkTypeConstructorErr (x2, xs)
       = NameClashTypeConstructors
-          { errLoc = dataDeclSpan x2
-          , errDataDecl = x2
-          , otherDataDecls = xs
+          { errLoc = tyConSpan x2
+          , errTyCon = x2
+          , otherTyCons = xs
           }
+        where tyConSpan = either interfaceSpan dataDeclSpan
 
     dataConstructorErrs
       = fmap mkDataConstructorErr                -- make errors for duplicates

@@ -1,4 +1,3 @@
-{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE ImplicitParams #-}
 {-# LANGUAGE LambdaCase #-}
@@ -8,7 +7,6 @@
 
 module Language.Granule.Checker.Checker where
 
-import Control.Monad (unless)
 import Control.Monad.State.Strict
 import Control.Monad.Except (throwError)
 import Data.List (genericLength)
@@ -22,8 +20,9 @@ import Language.Granule.Checker.Coeffects
 import Language.Granule.Checker.Effects
 import Language.Granule.Checker.Constraints
 import Language.Granule.Checker.Kinds
-import Language.Granule.Checker.KindsImplicit
 import Language.Granule.Checker.Exhaustivity
+import Language.Granule.Checker.Instance
+import Language.Granule.Checker.Interface.Check
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.NameClash
 import Language.Granule.Checker.Patterns
@@ -36,6 +35,8 @@ import Language.Granule.Checker.Types
 import Language.Granule.Checker.Variables
 import Language.Granule.Context
 
+import Language.Granule.Rewriter.Type (RewriteEnv)
+
 import Language.Granule.Syntax.Identifiers
 import Language.Granule.Syntax.Helpers (freeVars, hasHole)
 import Language.Granule.Syntax.Def
@@ -46,20 +47,26 @@ import Language.Granule.Syntax.Type
 
 import Language.Granule.Utils
 
---import Debug.Trace
 
 -- Checking (top-level)
 check :: (?globals :: Globals)
   => AST () ()
-  -> IO (Either (NonEmpty CheckerError) (AST () Type))
-check ast@(AST dataDecls defs imports) = evalChecker initState $ do
-    _    <- checkNameClashes ast
-    _    <- runAll checkTyCon dataDecls
-    _    <- runAll checkDataCons dataDecls
-    defs <- runAll kindCheckDef defs
-    let defCtxt = map (\(Def _ name _ tys) -> (name, tys)) defs
-    defs <- runAll (checkDef defCtxt) defs
-    pure $ AST dataDecls defs imports
+  -> IO (Either (NonEmpty CheckerError) (RewriteEnv, AST () Type))
+check ast@(AST dataDecls defs ifaces insts imports) = evalChecker initState $ do
+    _      <- checkNameClashes ast
+    _      <- runAll checkTyCon dataDecls
+    _      <- runAll checkDataCons dataDecls
+    _      <- runAll checkIFaceHead ifaces
+    _      <- runAll checkIFaceTys ifaces
+    _      <- runAll (checkInstHead solveConstraintsSafe) insts
+    _      <- runAll checkDefTy defs
+    insts' <- runAll (checkInstDefs checkDef') insts
+    defs   <- runAll checkDef defs
+
+    renv <- fmap checkerStateToRewriterEnv get
+
+    pure $ (renv, AST dataDecls defs ifaces insts' imports)
+
 
 -- TODO: we are checking for name clashes again here. Where is the best place
 -- to do this check?
@@ -108,7 +115,7 @@ checkDataCon
         tySchKind <- inferKindOfTypeInContext sp tyVars ty
 
         -- Freshen the data type constructors type
-        (ty, tyVarsFreshD, _, constraints, []) <-
+        (ty, tyVarsFreshD, _, (predConstrs, iConstrs), []) <-
              freshPolymorphicInstance ForallQ False (Forall s tyVars constraints ty) []
 
         -- Create a version of the data constructor that matches the data type head
@@ -118,7 +125,7 @@ checkDataCon
 
         -- Reconstruct the data constructor's new type scheme
         let tyVarsD' = tyVarsFreshD <> tyVarsNewAndOld
-        let tySch = Forall sp tyVarsD' constraints ty'
+        let tySch = Forall sp tyVarsD' (predConstrs <> fmap tyFromInst iConstrs) ty'
 
         case tySchKind of
           KType ->
@@ -204,48 +211,65 @@ checkAndGenerateSubstitution sp tName ty ixkinds =
     checkAndGenerateSubstitution' sp _ t _ =
       throw InvalidTypeDefinition { errLoc = sp, errTy = t }
 
-checkDef :: (?globals :: Globals)
-         => Ctxt TypeScheme  -- context of top-level definitions
-         -> Def () ()        -- definition
+
+checkDefTy :: (?globals :: Globals) => Def v a -> Checker ()
+checkDefTy d@(Def sp name _ tys) = do
+  kindCheckSig sp tys
+  registerDefSig sp name tys
+
+
+checkDef' :: (?globals :: Globals)
+         => Span -> Id -> [Equation () ()]
+         -> TypeScheme
          -> Checker (Def () Type)
-checkDef defCtxt (Def s defName equations tys@(Forall s_t foralls constraints ty)) = do
+checkDef' s defName equations tys@(Forall s_t foralls constraints ty) = do
 
     -- duplicate forall bindings
     case duplicates (map (sourceName . fst) foralls) of
       [] -> pure ()
       (d:ds) -> throwError $ fmap (DuplicateBindingError s_t) (d :| ds)
 
+    defCtxt <- fmap defContext get
     -- Clean up knowledge shared between equations of a definition
     modify (\st -> st { guardPredicates = [[]]
                       , patternConsumption = initialisePatternConsumptions equations } )
 
-    elaboratedEquations :: [Equation () Type] <- forM equations $ \equation -> do -- Checker [Maybe (Equation () Type)]
+    elaboratedEquations :: [Equation () Type] <- forM equations $ \equation -> do
         -- Erase the solver predicate between equations
         modify' $ \st -> st
             { predicateStack = []
             , tyVarContext = []
             , guardContexts = []
+            , iconsContext = []
             }
-        elaboratedEq <- checkEquation defCtxt defName equation tys
+        (elaboratedEq, subst) <- checkEquation defCtxt defName equation tys
 
         -- Solve the generated constraints
         checkerState <- get
-        debugM "tyVarContext" (pretty $ tyVarContext checkerState)
+        debugM "tyVarContext" . pretty =<< getTyVarContext
         let predStack = Conj $ predicateStack checkerState
         debugM "Solver predicate" $ pretty predStack
         solveConstraints predStack (getSpan equation) defName
+        constrStack <- getIConstraints
+        solveIConstraints solveConstraintsSafe subst constrStack (getSpan equation) tys
         pure elaboratedEq
 
     checkGuardsForImpossibility s defName
     checkGuardsForExhaustivity s defName ty equations
     pure $ Def s defName elaboratedEquations tys
 
+checkDef :: (?globals :: Globals)
+         => Def () ()        -- definition
+         -> Checker (Def () Type)
+checkDef (Def s defName equations tys@(Forall _ foralls _ ty)) =
+  checkDef' s defName equations tys
+
 checkEquation :: (?globals :: Globals) =>
      Ctxt TypeScheme -- context of top-level definitions
   -> Id              -- Name of the definition
   -> Equation () ()  -- Equation
   -> TypeScheme      -- Type scheme
-  -> Checker (Equation () Type)
+  -> Checker (Equation () Type, Substitution)
 
 checkEquation defCtxt _ (Equation s () pats expr) tys@(Forall _ foralls constraints ty) = do
   -- Check that the lhs doesn't introduce any duplicate binders
@@ -257,9 +281,9 @@ checkEquation defCtxt _ (Equation s () pats expr) tys@(Forall _ foralls constrai
   -- Create conjunct to capture the pattern constraints
   newConjunct
 
-  mapM_ (\ty -> do
-    pred <- compileTypeConstraintToConstraint s ty
-    addPredicate pred) constraints
+  let (predConstrs, iConstrs) = partitionConstraints constraints
+  mapM_ (compileAndAddPredicate s) predConstrs
+  mapM_ addIConstraint iConstrs
 
   -- Build the binding context for the branch pattern
   st <- get
@@ -298,8 +322,10 @@ checkEquation defCtxt _ (Equation s () pats expr) tys@(Forall _ foralls constrai
       subst'' <- combineSubstitutions s subst subst'
       let elab = Equation s ty elaborated_pats elaboratedExpr
 
+      substituteIConstraints subst''
+
       elab' <- substitute subst'' elab
-      return elab'
+      return (elab', subst'')
 
     -- Anything that was bound in the pattern but not used up
     (p:ps) -> illLinearityMismatch s (p:|ps)
@@ -349,8 +375,7 @@ checkExpr defs gam pol _ ty@(FunTy sig tau) (Val s _ (Abs _ p t e)) = do
   (tau', subst1) <- case t of
     Nothing -> return (tau, [])
     Just t' -> do
-      (eqT, unifiedType, subst) <- equalTypes s sig t'
-      unless eqT $ throw TypeError{ errLoc = s, tyExpected = sig, tyActual = t' }
+      (_, subst) <- requireEqualTypes s sig t'
       return (tau, subst)
 
   newConjunct
@@ -387,7 +412,7 @@ checkExpr defs gam pol _ ty@(FunTy sig tau) (Val s _ (Abs _ p t e)) = do
 -- TODO: needs more thought
 {- checkExpr defs gam pol topLevel tau
           (App s _ (App _ _ (Val _ _ (Var _ v)) (Val _ _ (NumFloat _ x))) e) | internalName v == "scale" = do
-    equalTypes s (TyCon $ mkId "Float") tau
+    equalTypesAndUnify s (TyCon $ mkId "Float") tau
     checkExpr defs gam pol topLevel (Box (CFloat (toRational x)) (TyCon $ mkId "Float")) e
 -}
 
@@ -555,28 +580,28 @@ checkExpr defs gam pol topLevel tau e = do
 
   (tau', gam', subst', elaboratedE) <- synthExpr defs gam pol e
 
-  (tyEq, _, subst) <-
+  eq <-
     case pol of
       Positive -> do
         debugM "+ Compare for equality " $ pretty tau' <> " = " <> pretty tau
         if topLevel
           -- If we are checking a top-level, then don't allow overapproximation
-          then equalTypesWithPolarity (getSpan e) SndIsSpec tau' tau
-          else lEqualTypesWithPolarity (getSpan e) SndIsSpec tau' tau
+          then checkEquality (equalTypesWithPolarity (getSpan e) SndIsSpec tau') tau
+          else checkEquality (lEqualTypesWithPolarity (getSpan e) SndIsSpec tau') tau
 
       -- i.e., this check is from a synth
       Negative -> do
         debugM "- Compare for equality " $ pretty tau <> " = " <> pretty tau'
         if topLevel
           -- If we are checking a top-level, then don't allow overapproximation
-          then equalTypesWithPolarity (getSpan e) FstIsSpec tau' tau
-          else lEqualTypesWithPolarity (getSpan e) FstIsSpec tau' tau
+          then checkEquality (equalTypesWithPolarity (getSpan e) FstIsSpec tau') tau
+          else checkEquality (lEqualTypesWithPolarity (getSpan e) FstIsSpec tau') tau
 
-  if tyEq
-    then do
+  case eq of
+    (True, subst) -> do
       substFinal <- combineSubstitutions (getSpan e) subst subst'
       return (gam', substFinal, elaboratedE)
-    else do
+    _ -> do
       case pol of
         Positive -> throw TypeError{ errLoc = getSpan e, tyExpected = tau , tyActual = tau' }
         Negative -> throw TypeError{ errLoc = getSpan e, tyExpected = tau', tyActual =  tau }
@@ -587,7 +612,7 @@ synthExpr :: (?globals :: Globals)
           => Ctxt TypeScheme   -- ^ Context of top-level definitions
           -> Ctxt Assumption   -- ^ Local typing context
           -> Polarity          -- ^ Polarity of subgrading
-          -> Expr () ()        -- ^ Expression
+          -> Expr () ()         -- ^ Expression
           -> Checker (Type, Ctxt Assumption, Substitution, Expr () Type)
 
 -- Hit an unfilled hole
@@ -630,7 +655,7 @@ synthExpr _ gam _ (Val s _ (Constr _ c [])) = do
       -- Freshen the constructor
       -- (discarding any fresh type variables, info not needed here)
 
-      (ty, _, _, constraints, coercions') <- freshPolymorphicInstance InstanceQ False tySch coercions
+      (ty, _, _, (constraints, _), coercions') <- freshPolymorphicInstance InstanceQ False tySch coercions
 
       mapM_ (\ty -> do
         pred <- compileTypeConstraintToConstraint s ty
@@ -722,7 +747,7 @@ synthExpr defs gam pol (LetDiamond s _ p optionalTySig e1 e2) = do
       Diamond ef2 ty2 -> return (ef2, ty2)
       t -> throw ExpectedEffectType{ errLoc = s, errTy = t }
 
-  optionalSigEquality s optionalTySig ty1
+  _ <- optionalSigEquality s optionalTySig ty1
 
   -- Check that usage matches the binding grades/linearity
   -- (performs the linearity check)
@@ -750,11 +775,10 @@ synthExpr defs gam _ (Val s _ (Var _ x)) =
        -- Try definitions in scope
        case lookup x (defs <> Primitives.builtins) of
          Just tyScheme  -> do
-           (ty', _, _, constraints, []) <- freshPolymorphicInstance InstanceQ False tyScheme [] -- discard list of fresh type variables
+           (ty', _, _, (constraints, iconstraints), []) <- freshPolymorphicInstance InstanceQ False tyScheme [] -- discard list of fresh type variables
 
-           mapM_ (\ty -> do
-             pred <- compileTypeConstraintToConstraint s ty
-             addPredicate pred) constraints
+           mapM_ (compileAndAddPredicate s) constraints
+           mapM_ addIConstraint iconstraints
 
            let elaborated = Val s ty' (Var ty' x)
            return (ty', [], [], elaborated)
@@ -793,9 +817,11 @@ synthExpr defs gam pol (App s _ e e') = do
          subst <- combineSubstitutions s subst1 subst2
 
          -- Synth subst
-         tau    <- substitute subst2 tau
+         tau    <- substitute subst tau
 
-         let elaborated = App s tau elaboratedL elaboratedR
+         substituteIConstraints subst
+
+         elaborated <- substitute subst (App s tau elaboratedL elaboratedR)
          return (tau, gamNew, subst, elaborated)
 
       -- Not a function type
@@ -855,8 +881,8 @@ synthExpr defs gam pol (Binop s _ op e1 e2) = do
     selectFirstByType t1 t2 ((FunTy opt1 (FunTy opt2 resultTy)):ops) = do
       -- Attempt to use this typing
       (result, local) <- peekChecker $ do
-         (eq1, _, _) <- equalTypes s t1 opt1
-         (eq2, _, _) <- equalTypes s t2 opt2
+         eq1 <- typesAreEqualWithCheck s t1 opt1
+         eq2 <- typesAreEqualWithCheck s t2 opt2
          return (eq1 && eq2)
       -- If successful then return this local computation
       case result of
@@ -930,15 +956,13 @@ synthExpr _ _ _ e =
   throw NeedTypeSignature{ errLoc = getSpan e, errExpr = e }
 
 -- Check an optional type signature for equality against a type
-optionalSigEquality :: (?globals :: Globals) => Span -> Maybe Type -> Type -> Checker ()
-optionalSigEquality _ Nothing _ = pure ()
-optionalSigEquality s (Just t) t' = do
-  _ <- equalTypes s t' t
-  pure ()
+optionalSigEquality :: (?globals :: Globals) => Span -> Maybe Type -> Type -> Checker Bool
+optionalSigEquality _ Nothing _ = return True
+optionalSigEquality s (Just t) t' = typesAreEqualWithCheck s t' t
 
-solveConstraints :: (?globals :: Globals) => Pred -> Span -> Id -> Checker ()
-solveConstraints predicate s name = do
 
+solveConstraintsSafe :: (?globals :: Globals) => Pred -> Span -> Id -> Checker (Maybe [CheckerError])
+solveConstraintsSafe predicate s name = do
   -- Get the coeffect kind context and constraints
   checkerState <- get
   let ctxtCk  = tyVarContext checkerState
@@ -947,27 +971,38 @@ solveConstraints predicate s name = do
   result <- liftIO $ provePredicate predicate coeffectVars
 
   case result of
-    QED -> return ()
+    QED -> success
     NotValid msg -> do
-      msg' <- rewriteMessage msg
-      simplPred <- simplifyPred predicate
+       msg' <- rewriteMessage msg
+       simplPred <- simplifyPred predicate
 
-      -- try trivial unsats again
-      let unsats' = trivialUnsatisfiableConstraints simplPred
-      if not (null unsats')
-        then mapM_ (\c -> throw GradingError{ errLoc = getSpan c, errConstraint = Neg c }) unsats'
-        else
-          if msg' == "is Falsifiable\n"
-            then throw SolverErrorFalsifiableTheorem
-              { errLoc = s, errDefId = name, errPred = simplPred }
-            else throw SolverErrorCounterExample
-              { errLoc = s, errDefId = name, errPred = simplPred }
+       -- try trivial unsats again
+       let unsats' = trivialUnsatisfiableConstraints simplPred
+       if not (null unsats')
+         then fmap pure $ mapM (\c -> pure GradingError{ errLoc = getSpan c, errConstraint = Neg c }) unsats'
+         else
+           if msg' == "is Falsifiable\n"
+             then failed [SolverErrorFalsifiableTheorem
+               { errLoc = s, errDefId = name, errPred = simplPred }]
+             else failed [SolverErrorCounterExample
+               { errLoc = s, errDefId = name, errPred = simplPred }]
+
     NotValidTrivial unsats ->
-       mapM_ (\c -> throw GradingError{ errLoc = getSpan c, errConstraint = Neg c }) unsats
+       failed $ fmap (\c -> GradingError{ errLoc = getSpan c, errConstraint = Neg c }) unsats
     Timeout ->
-        throw SolverTimeout{ errLoc = s, errSolverTimeoutMillis = solverTimeoutMillis, errDefId = name, errContext = "grading", errPred = predicate }
+       throw SolverTimeout{ errLoc = s, errSolverTimeoutMillis = solverTimeoutMillis
+                          , errDefId = name, errContext = "grading", errPred = predicate }
     OtherSolverError msg -> throw SolverError{ errLoc = s, errMsg = msg }
     SolverProofError msg -> error msg
+    where failed = pure . Just
+          success = pure Nothing
+
+
+solveConstraints :: (?globals :: Globals) => Pred -> Span -> Id -> Checker ()
+solveConstraints predicate s name = do
+  res <- solveConstraintsSafe predicate s name
+  maybe (pure ()) (mapM_ throw) res
+
 
 -- Rewrite an error message coming from the solver
 rewriteMessage :: String -> Checker String
@@ -1275,7 +1310,7 @@ justLinear ((x, Linear t) : xs) = (x, Linear t) : justLinear xs
 justLinear ((x, _) : xs) = justLinear xs
 
 checkGuardsForExhaustivity :: (?globals :: Globals)
-  => Span -> Id -> Type -> [Equation () ()] -> Checker ()
+  => Span -> Id -> Type -> [Equation v ()] -> Checker ()
 checkGuardsForExhaustivity s name ty eqs = do
   debugM "Guard exhaustivity" "todo"
   return ()

@@ -1,0 +1,74 @@
+------
+--- Module: Eq
+--- Description: Equality
+--- Authors: Ben Moon
+--- License: BSD3
+--- Copyright: (c) Authors 2019
+--- Issue-tracking: https://github.com/granule-project/granule/issues
+--- Repository: https://github.com/granule-project/granule
+------
+
+
+import Bool
+
+
+-- | Interface for types that have boolean equality.
+interface Eq a where
+  -- | Compare the two arguments for equality.
+  equal : a -> a -> Bool
+
+
+-- | Compare the two arguments for inequality.
+notEqual : forall {a : Type} . {Eq a} => a -> a -> Bool
+notEqual x y = not (equal x y)
+
+
+instance Eq Bool where
+  equal True  x = x;
+  equal False x = not x
+
+
+----------------------------
+-- Instances for builtins --
+----------------------------
+
+
+instance {Eq a, Eq b} => Eq (a, b) where
+  equal (x1, y1) (x2, y2) = (equal x1 x2) `and'` (equal y1 y2)
+
+
+instance Eq () where
+  equal () () = True
+
+
+instance Eq Int where
+  equal x y = x ≡ y
+
+
+instance Eq Float where
+  equal x y = x ≡ y
+
+
+-- this doesn't type-check now ('ReadMode' etc.
+-- have kind 'HandleType' rather than 'Type').
+-- instance Eq IOMode where
+--   equal ReadMode ReadMode           = True;
+--   equal WriteMode WriteMode         = True;
+--   equal AppendMode AppendMode       = True;
+--   equal ReadWriteMode ReadWriteMode = True;
+--
+--   equal ReadMode WriteMode     = False;
+--   equal ReadMode AppendMode    = False;
+--   equal ReadMode ReadWriteMode = False;
+--
+--   equal WriteMode ReadMode      = False;
+--   equal WriteMode AppendMode    = False;
+--   equal WriteMode ReadWriteMode = False;
+--
+--   equal AppendMode ReadMode      = False;
+--   equal AppendMode WriteMode     = False;
+--   equal AppendMode ReadWriteMode = False;
+--
+--   equal ReadWriteMode ReadMode   = False;
+--   equal ReadWriteMode WriteMode  = False;
+--   equal ReadWriteMode AppendMode = False

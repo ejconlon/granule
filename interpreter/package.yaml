@@ -47,6 +47,7 @@ library:
   - Language.Granule.Interpreter
   - Language.Granule.Interpreter.Eval
   - Language.Granule.Interpreter.Desugar
+  - Language.Granule.Interpreter.Type
 
 executables:
   gr:

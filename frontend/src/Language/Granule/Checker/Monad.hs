@@ -15,7 +15,7 @@ module Language.Granule.Checker.Monad where
 
 import Data.Either (partitionEithers)
 import Data.Foldable (toList)
-import Data.List (intercalate)
+import Data.List ((\\), intercalate, nub)
 import Data.List.NonEmpty (NonEmpty(..))
 import qualified Data.Map as M
 import Data.Semigroup (sconcat)
@@ -24,15 +24,18 @@ import Control.Monad.Except
 import Control.Monad.Fail (MonadFail)
 import Control.Monad.Identity
 
+import Language.Granule.Checker.Instance (Inst)
 import Language.Granule.Checker.SubstitutionContexts
 import Language.Granule.Checker.LaTeX
 import Language.Granule.Checker.Predicates
 import qualified Language.Granule.Checker.Primitives as Primitives
 import Language.Granule.Context
 
+import Language.Granule.Rewriter.Type (RewriteEnv, buildRewriterEnv)
+
 import Language.Granule.Syntax.Def
 import Language.Granule.Syntax.Expr (Operator, Expr)
-import Language.Granule.Syntax.Helpers (FreshenerState(..), freshen, Term(..))
+import Language.Granule.Syntax.Helpers (FreshenerState(..), freshen, Term(..), freeVars)
 import Language.Granule.Syntax.Identifiers
 import Language.Granule.Syntax.Type
 import Language.Granule.Syntax.Pattern
@@ -130,6 +133,12 @@ meetConsumption Empty Full = NotFull
 meetConsumption Full Empty = NotFull
 
 
+data IFaceCtxt = IFaceCtxt
+  { ifaceParams :: [(Id, Kind)]
+  , ifaceSigs :: Ctxt TypeScheme
+  , ifaceConstraints :: [Inst]
+  } deriving (Show, Eq)
+
 data CheckerState = CS
             { -- Fresh variable id state
               uniqueVarIdCounterMap  :: M.Map String Nat
@@ -159,6 +168,23 @@ data CheckerState = CS
             , typeConstructors :: Ctxt (Kind, Cardinality) -- the kind of the and number of data constructors
             , dataConstructors :: Ctxt (TypeScheme, Substitution)
 
+            -- | Mapping from interface names to detailed interface information
+            , ifaceContext :: Ctxt IFaceCtxt
+            -- | Mapping from interface names to a mapping from
+            -- | instances to their constraints
+            , instanceContext :: Ctxt [(Inst, [Type])]
+            -- | Map from (Instance, method name) pairs to the
+            -- | instance-specific typescheme
+            , instanceSigs :: M.Map (Inst, Id) TypeScheme
+            -- | Map from definition names to their expanded constraints
+            , expandedConstraints :: Ctxt [Inst]
+            -- | The instances required to satisfy the current
+            -- | equation (i.e., its context)
+            , iconsContext :: [Inst]
+
+            -- | Mapping from definition names to their associated typeschemes
+            , defContext :: Ctxt TypeScheme
+
             -- LaTeX derivation
             , deriv      :: Maybe Derivation
             , derivStack :: [Derivation]
@@ -167,6 +193,7 @@ data CheckerState = CS
             -- , warnings :: [Warning]
             }
   deriving (Show, Eq) -- for debugging
+
 
 -- | Initial checker context state
 initState :: CheckerState
@@ -179,11 +206,105 @@ initState = CS { uniqueVarIdCounterMap = M.empty
                , patternConsumption = []
                , typeConstructors = Primitives.typeConstructors
                , dataConstructors = Primitives.dataConstructors
+               , ifaceContext = []
+               , instanceContext = []
+               , instanceSigs = M.empty
+               , expandedConstraints = []
+               , iconsContext = []
+               , defContext = []
                , deriv = Nothing
                , derivStack = []
                }
 
+
+-- | Extract useful information for the rewriter from the checker state.
+checkerStateToRewriterEnv :: CheckerState -> RewriteEnv
+checkerStateToRewriterEnv cs =
+    buildRewriterEnv
+      (M.toList $ instanceSigs cs)
+      (expandedConstraints cs)
+      (typeConstructors cs)
+      (dataConstructors cs)
+      (tyVarContext cs)
+
+
 -- *** Various helpers for manipulating the context
+
+lookupContext :: (CheckerState -> Ctxt a) -> Id -> Checker (Maybe a)
+lookupContext ctxtf name = fmap (lookup name . ctxtf) get
+
+getTypeScheme :: Id -> Checker (Maybe TypeScheme)
+getTypeScheme = lookupContext defContext
+
+
+getDefContext :: Checker (Ctxt TypeScheme)
+getDefContext = fmap defContext get
+
+
+-- | Get the current variable kind/quantification context.
+getTyVarContext :: Checker (Ctxt (Kind, Quantifier))
+getTyVarContext = fmap tyVarContext get
+
+
+-- | Set the current variable kind/quantification context.
+putTyVarContext :: Ctxt (Kind, Quantifier) -> Checker ()
+putTyVarContext tvc = modify' $ \st -> st { tyVarContext = tvc }
+
+
+registerTyCon :: Span -> Id -> Kind -> Cardinality -> Checker ()
+registerTyCon sp name kind card = do
+  modify' $ \st -> st { typeConstructors = (name, (kind, card)) : typeConstructors st }
+
+
+getIFaceContext :: Checker (Ctxt IFaceCtxt)
+getIFaceContext = fmap ifaceContext get
+
+
+-- | Get the kind of a type constructor.
+-- |
+-- | This requires that the type constructor is in scope.
+getTyConKind :: Span -> Id -> Checker Kind
+getTyConKind sp name = fmap fst $ requireInScope typeConstructorScope sp name
+
+
+registerInterface :: Span -> Id -> [(Id, Kind)] -> [Inst] -> Ctxt TypeScheme -> Checker ()
+registerInterface sp name params constrs sigs = do
+  let ifaceCtxt = IFaceCtxt { ifaceParams = params
+                            , ifaceSigs = sigs
+                            , ifaceConstraints = constrs
+                            }
+  modify' $ \st -> st { ifaceContext = (name, ifaceCtxt) : ifaceContext st }
+
+
+registerExpandedConstraints :: Span -> Id -> [Inst] -> Checker ()
+registerExpandedConstraints sp name constrs =
+    modify' $ \st -> st { expandedConstraints = (name, constrs) : expandedConstraints st }
+
+
+getConstraintsExpanded :: (?globals :: Globals) => Span -> Id -> Checker [Inst]
+getConstraintsExpanded sp n = do
+    maybeConstrs <- lookupContext expandedConstraints n
+    maybe (error $ "internal error: attempted to look up expanded constraints for '"
+            <> pretty n <> "' before it has been registered") pure maybeConstrs
+
+
+-- | Get the set of interface constraints in scope.
+getIConstraints :: Checker [Inst]
+getIConstraints = fmap iconsContext get
+
+
+putIcons :: [Inst] -> Checker ()
+putIcons ts = modify' $ \st -> st { iconsContext = nub ts }
+
+
+addIConstraint :: Inst -> Checker ()
+addIConstraint ty =
+  modify' $ \st -> st { iconsContext = nub $ ty : iconsContext st }
+
+
+-------------------------------
+----- Sub-checker helpers -----
+-------------------------------
 
 
 {- | Given a computation in the checker monad, peek the result without
@@ -197,6 +318,26 @@ peekChecker k = do
   checkerState <- get
   (result, localState) <- liftIO $ runChecker checkerState k
   pure (result, put localState)
+
+
+-- | @withFreeVarsBound ty q c@ executes the checker @c@, but with
+-- | free variables in @ty@ bound with quantifier @q@.
+withFreeVarsBound :: (Term t) => t -> Quantifier -> Checker a -> Checker a
+withFreeVarsBound ty q c = do
+  names <- fmap (fmap fst . tyVarContext) get
+  -- make sure we don't re-bind any already-bound variables
+  let newVars = freeVars ty \\ names
+      binds = fmap (\v -> (v, KType)) newVars
+  withBindings binds q c
+
+
+-- | Run the checker with the given bindings present.
+withBindings :: [(Id, Kind)] -> Quantifier -> Checker a -> Checker a
+withBindings binds q c = do
+  tyVarContextInit <- fmap tyVarContext get
+  modify $ \st -> st { tyVarContext = fmap (\(v,k) -> (v, (k, q))) binds <> tyVarContext st }
+  c <* modify (\st -> st { tyVarContext = tyVarContextInit })
+
 
 pushGuardContext :: Ctxt Assumption -> Checker ()
 pushGuardContext ctxt = do
@@ -342,6 +483,31 @@ addConstraintToPreviousFrame c = do
           stack ->
             put (checkerState { predicateStack = Conj [Con c] : stack })
 
+
+-----------------------
+-- Namespace Helpers --
+-----------------------
+
+
+type Scope a = (CheckerState -> Ctxt a, Span -> Id -> CheckerError)
+
+
+typeConstructorScope :: Scope (Kind, Cardinality)
+typeConstructorScope = (typeConstructors, \sp n -> UnboundTypeConstructor{ errLoc = sp, errId = n })
+
+
+interfaceScope :: Scope IFaceCtxt
+interfaceScope = (ifaceContext, \sp n -> UnboundInterface{ errLoc = sp, errId = n })
+
+
+-- | Retrieve the value associated with a name in the retrieved
+-- | context, failing if it doesn't
+requireInScope :: Scope a -> Span -> Id -> Checker a
+requireInScope (ctxtf, errf) sp name = do
+  def <- lookup name <$> gets ctxtf
+  maybe (throw $ errf sp name) pure def
+
+
 -- | Convenience function for throwing a single error
 throw :: CheckerError -> Checker a
 throw = throwError . pure
@@ -376,6 +542,8 @@ data CheckerError
   | PatternArityError
     { errLoc :: Span, errId :: Id }
   | UnboundVariableError
+    { errLoc :: Span, errId :: Id }
+  | UnboundKindVariable
     { errLoc :: Span, errId :: Id }
   | UnboundTypeVariable
     { errLoc :: Span, errId :: Id }
@@ -419,6 +587,8 @@ data CheckerError
     { errLoc :: Span, errId :: Id }
   | UnboundTypeConstructor
     { errLoc :: Span, errId :: Id }
+  | UnboundInterface
+    { errLoc :: Span, errId :: Id }
   | TooManyPatternsError
     { errLoc :: Span, errPats :: NonEmpty (Pattern ()), tyExpected :: Type, tyActual :: Type }
   | DataConstructorReturnTypeError
@@ -448,7 +618,8 @@ data CheckerError
   | ImpossiblePatternMatchTrivial
     { errLoc :: Span, errId :: Id, errUnsats :: [Constraint] }
   | NameClashTypeConstructors -- we arbitrarily use the second thing that clashed as the error location
-    { errLoc :: Span, errDataDecl :: DataDecl, otherDataDecls :: NonEmpty DataDecl }
+    -- interfaces and type constructors share the same namespace
+    { errLoc :: Span, errTyCon :: Either Interface DataDecl, otherTyCons :: NonEmpty (Either Interface DataDecl) }
   | NameClashDataConstructors -- we arbitrarily use the second thing that clashed as the error location
     { errLoc :: Span, errDataConstructor :: DataConstr, otherDataConstructors :: NonEmpty DataConstr }
   | NameClashDefs -- we arbitrarily use the second thing that clashed as the error location
@@ -459,6 +630,45 @@ data CheckerError
     { errLoc :: Span, errTy :: Type }
   | UnknownResourceAlgebra
     { errLoc :: Span, errTy :: Type, errK :: Kind }
+
+  -- | Error for features that are presently not implemented.
+  | NotImplemented
+    { errLoc :: Span, errDesc :: String }
+
+  -- | We can't unify two universally quantified variables.
+  | CannotUnifyUniversalWithConcrete
+    { errLoc :: Span, errVar1 :: Id, errVar2 :: Id }
+  -- | Inequality (for when a more specific reason is not known).
+  | EqualityMismatch
+    { errLoc :: Span, errDesc :: String, errVar1 :: Id, errVar2 :: Id }
+  -- | Kind inequality (for when a more specific reason is not known).
+  | KindEqualityMismatch
+    { errLoc :: Span, errDesc :: String, errK1 :: Kind, errK2 :: Kind }
+  -- | Coeffect inequality (for when a more specific reason is not known).
+  | CoeffectEqualityMismatch
+    { errLoc :: Span, errDesc :: String, errC1 :: Coeffect, errC2 :: Coeffect }
+  -- | A variable cannot have two distinct values simultaneously.
+  | CannotBeBoth
+    { errLoc :: Span, errVar :: Id, errVal1 :: Substitutors, errVal2 :: Substitutors }
+  -- | A variable cannot have two distinct kinds simultaneously.
+  | ConflictingKinds
+    { errLoc :: Span, errVar :: Id, errVal1 :: Substitutors, errVal2 :: Substitutors }
+
+  -- Interface-related errors
+  | OverlappingInstance
+    { errLoc :: Span, errInst1 :: Inst, errInst2 :: Inst }
+  | WrongNumberOfParameters
+    { errLoc :: Span, errInst :: Inst, errParamNumExp :: Int, errParamNumAct :: Int }
+  | WrongNumberOfParametersConstraint
+    { errLoc :: Span, errInst :: Inst, errParamNumExp :: Int, errParamNumAct :: Int }
+  | MissingImplementation
+    { errLoc :: Span, errId :: Id, errIFace :: Id }
+  | UnsatisfiedInstance
+    { errLoc :: Span, errInst :: Inst }
+  | MethodNotMember
+    { errLoc :: Span, errId :: Id, errIFace :: Id }
+  | NotAnInterface
+    { errLoc :: Span, errInst :: Inst }
   deriving (Show, Eq)
 
 
@@ -478,6 +688,7 @@ instance UserMsg CheckerError where
   title PatternTypingMismatch{} = "Pattern typing mismatch"
   title PatternArityError{} = "Pattern arity error"
   title UnboundVariableError{} = "Unbound variable error"
+  title UnboundKindVariable{} = "Unbound kind variable"
   title UnboundTypeVariable{} = "Unbound type variable"
   title RefutablePatternError{} = "Pattern is refutable"
   title TypeConstructorNameClash{} = "Type constructor name clash"
@@ -499,6 +710,7 @@ instance UserMsg CheckerError where
   title DisallowedCoeffectNesting{} = "Bad coeffect nesting"
   title UnboundDataConstructor{} = "Unbound data constructor"
   title UnboundTypeConstructor{} = "Unbound type constructor"
+  title UnboundInterface{} = "Unbound interface"
   title TooManyPatternsError{} = "Too many patterns"
   title DataConstructorReturnTypeError{} = "Wrong return type in data constructor"
   title MalformedDataConstructorType{} = "Malformed data constructor type"
@@ -520,6 +732,22 @@ instance UserMsg CheckerError where
   title InvalidTypeDefinition{} = "Invalid type definition"
   title UnknownResourceAlgebra{} = "Type error"
 
+  title NotImplemented{} = "Not implemented"
+  title CannotUnifyUniversalWithConcrete{} = "Unification error"
+  title EqualityMismatch{} = "Equality error"
+  title KindEqualityMismatch{} = "Kind equality error"
+  title CoeffectEqualityMismatch{} = "Coeffect equality error"
+  title CannotBeBoth{} = "Equality error"
+  title ConflictingKinds{} = "Conflicting kinds"
+  -- Interface-related errors
+  title OverlappingInstance{} = "Overlapping instance"
+  title WrongNumberOfParameters{} = "Wrong number of parameters"
+  title WrongNumberOfParametersConstraint{} = "Wrong number of parameters"
+  title MissingImplementation{} = "Missing implementation"
+  title UnsatisfiedInstance{} = "Unsatisfied instance"
+  title MethodNotMember{} = "Bad method"
+  title NotAnInterface{} = "Invalid constraint"
+
   msg HoleMessage{..} =
     (case holeTy of
       Nothing -> "\n   Hole occurs in synthesis position so the type is not yet known"
@@ -535,7 +763,6 @@ instance UserMsg CheckerError where
       else "\n\n   Type context:" <> (concatMap (\(v, (t , _)) ->  "\n     "
                                                 <> pretty v
                                                 <> " : " <> pretty t) tyContext) <> "\n")
-
   msg TypeError{..} = if pretty tyExpected == pretty tyActual
     then "Expected `" <> pretty tyExpected <> "` but got `" <> pretty tyActual <> "` coming from a different binding"
     else "Expected `" <> pretty tyExpected <> "` but got `" <> pretty tyActual <> "`"
@@ -593,6 +820,8 @@ instance UserMsg CheckerError where
       <> "` is applied to too many arguments."
 
   msg UnboundVariableError{..} = "`" <> pretty errId <> "`"
+
+  msg UnboundKindVariable{..} = "`" <> pretty errId <> "`"
 
   msg UnboundTypeVariable{..}
     = "`" <> pretty errId <> "` is not quantified"
@@ -682,6 +911,9 @@ instance UserMsg CheckerError where
   msg UnboundTypeConstructor{..}
     = "`" <> pretty errId <> "`"
 
+  msg UnboundInterface{..}
+    = "`" <> pretty errId <> "`"
+
   msg TooManyPatternsError{..}
     = "Couldn't match expected type `"
     <> pretty tyExpected
@@ -748,8 +980,10 @@ instance UserMsg CheckerError where
     <> unlines (map pretty errUnsats)
 
   msg NameClashTypeConstructors{..}
-    = "`" <> pretty (dataDeclId errDataDecl) <> "` already defined at\n\t"
-    <> (intercalate "\n\t" . map (pretty . dataDeclSpan) . toList) otherDataDecls
+    = "`" <> pretty (tyConErrId errTyCon) <> "` already defined at\n\t"
+    <> (intercalate "\n\t" . map (pretty . tyConErrSpan) . toList) otherTyCons
+    where tyConErrId = either interfaceId dataDeclId
+          tyConErrSpan = either interfaceSpan dataDeclSpan
 
   msg NameClashDataConstructors{..}
     = "`" <> pretty (dataConstrId errDataConstructor) <> "` already defined at\n\t"
@@ -769,9 +1003,69 @@ instance UserMsg CheckerError where
   msg UnknownResourceAlgebra{ errK, errTy }
     = "There is no resource algebra defined for `" <> pretty errK <> "`, arising from " <> pretty errTy
 
+  msg NotImplemented{..} = errDesc
+
+  msg CannotUnifyUniversalWithConcrete{..}
+    = concat [ prettyQuoted errVar1, " and ", prettyQuoted errVar2
+             , " are both universally quantified, and thus cannot be equal."]
+
+  msg EqualityMismatch{..}
+    = concat [ errDesc, prettyQuoted errVar1, " and ", prettyQuoted errVar2
+             , " are not equal." ]
+
+  msg KindEqualityMismatch{..}
+    = concat [ errDesc, prettyQuoted errK1, " and ", prettyQuoted errK2
+             , " are not equal." ]
+
+  msg CoeffectEqualityMismatch{..}
+    = concat [ errDesc, prettyQuoted errC1, " and ", prettyQuoted errC2
+             , " are not equal." ]
+
+  msg CannotBeBoth{..}
+    = let t1 = fromSubst errVal1
+          t2 = fromSubst errVal2
+      in concat [ prettyQuoted errVar, " cannot be equal to both ", t1, " and ", t2 ]
+    where fromSubst (SubstT t) = prettyQuoted t
+          fromSubst (SubstK k) = prettyQuoted k
+          fromSubst (SubstC c) = prettyQuoted c
+
+  msg ConflictingKinds{..}
+    = concat [ prettyQuoted errVar, " cannot have both kind "
+             , prettyQuotedS errVal1, " and kind ", prettyQuotedS errVal2 ]
+    where prettyQuotedS (SubstT t) = prettyQuoted t
+          prettyQuotedS (SubstK k) = prettyQuoted k
+          prettyQuotedS (SubstC c) = prettyQuoted c
+
+  -- Interface-related errors
+  msg OverlappingInstance{..}
+    = concat [ "The instance ", prettyQuoted errInst1
+             , " overlaps with the previously defined instance "
+             , prettyQuoted errInst2 ]
+
+  msg WrongNumberOfParameters{..}
+    = concat [ "Wrong number of parameters in instance ", prettyQuoted errInst, "."
+             , " Expected ", show errParamNumExp, " but got ", show errParamNumAct, "."]
+
+  msg WrongNumberOfParametersConstraint{..}
+    = concat [ "Wrong number of parameters in an application of an interface constraint ", prettyQuoted errInst, "."
+             , " Expected ", show errParamNumExp, " but got ", show errParamNumAct, "."]
+
+  msg MissingImplementation{..}
+    = concat [ "No implementation given for ", prettyQuoted errId
+             , " which is a required member of interface "
+             , prettyQuoted errIFace ]
+
+  msg UnsatisfiedInstance{..}
+    = concat [ "No instance for ", prettyQuoted errInst ]
+
+  msg MethodNotMember{..}
+    = concat [ prettyQuoted errId, " is not a member of interface ", pretty errIFace ]
+
+  msg NotAnInterface{..}
+    = concat [ prettyQuoted errInst, " does not represent an interface constraint." ]
+
   color HoleMessage{} = Blue
   color _ = Red
-
 
 data LinearityMismatch
   = LinearNotUsed Id

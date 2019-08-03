@@ -79,8 +79,8 @@ spec = let ?globals = mempty in do
       it "simple elaborator tests" $ do
         -- Simple definitions
         -- \x -> x + 1
-        (AST _ (def1:_) _) <- parseAndDoImportsAndFreshenDefs "foo : Int -> Int\nfoo x = x + 1"
-        (Right defElab, _) <- runChecker initState (checkDef [] def1)
+        (AST _ (def1:_) _ _ _) <- parseAndDoImportsAndFreshenDefs "foo : Int -> Int\nfoo x = x + 1"
+        (Right defElab, _) <- runChecker initState (checkDef def1)
         annotation (extractMainExpr defElab) `shouldBe` (TyCon $ mkId "Int")
 
 extractMainExpr :: Def v a -> Expr v a
@@ -102,4 +102,3 @@ cNatOrdered x = CSig (CNat x) natInterval
 
 natInterval :: Type
 natInterval = TyApp (TyCon $ mkId "Interval") (TyCon $ mkId "Nat")
-

@@ -9,13 +9,14 @@ import Control.Monad.State.Strict
 import Data.List.NonEmpty (NonEmpty(..))
 
 import Language.Granule.Checker.Constraints.Compile
-import Language.Granule.Checker.Types (equalTypesRelatedCoeffectsAndUnify, SpecIndicator(..))
+import Language.Granule.Checker.Types (SpecIndicator(..))
 import Language.Granule.Checker.Coeffects
 import Language.Granule.Checker.Monad
 import Language.Granule.Checker.Predicates
 import Language.Granule.Checker.Kinds
 import Language.Granule.Checker.SubstitutionContexts
 import Language.Granule.Checker.Substitution
+import Language.Granule.Checker.Types
 import Language.Granule.Checker.Variables
 
 import Language.Granule.Context
@@ -173,7 +174,7 @@ ctxtFromTypedPattern' outerBoxTy _ ty p@(PConstr s _ dataC ps) cons = do
 
       definiteUnification s outerBoxTy ty
 
-      (dataConstructorTypeFresh, freshTyVarsCtxt, freshTyVarSubst, constraints, coercions') <-
+      (dataConstructorTypeFresh, freshTyVarsCtxt, freshTyVarSubst, (constraints, []), coercions') <-
           freshPolymorphicInstance BoundQ True tySch coercions
 
       mapM_ (\ty -> do
@@ -199,13 +200,11 @@ ctxtFromTypedPattern' outerBoxTy _ ty p@(PConstr s _ dataC ps) cons = do
       debugM "ctxt" $ "\t### eqR (ty) = " <> show ty <> "\n"
 
       debugM "Patterns.ctxtFromTypedPattern" $ pretty dataConstructorTypeFresh <> "\n" <> pretty ty
-      areEq <- equalTypesRelatedCoeffectsAndUnify s Eq PatternCtxt (resultType dataConstructorTypeFresh) ty
-      case areEq of
-        (True, _, unifiers) -> do
-
+      (areEqual, unifiers) <- equalTypesRelatedCoeffects s Eq (resultType dataConstructorTypeFresh) ty PatternCtxt
+      if areEqual then (do
           -- Register coercions as equalities
           mapM_ (\(var, SubstT ty) ->
-                        equalTypesRelatedCoeffectsAndUnify s Eq PatternCtxt (TyVar var) ty) coercions'
+                    requireEqualTypesRelatedCoeffects s Eq PatternCtxt (TyVar var) ty) coercions'
 
           dataConstructorIndexRewritten <- substitute unifiers dataConstructorTypeFresh
           dataConstructorIndexRewrittenAndSpecialised <- substitute coercions' dataConstructorIndexRewritten
@@ -231,18 +230,16 @@ ctxtFromTypedPattern' outerBoxTy _ ty p@(PConstr s _ dataC ps) cons = do
                   subst,                          -- returned the combined substitution
                   elabP,                          -- elaborated pattern
                   consumptionOut)                 -- final consumption effect
+          )
 
-        _ -> throw PatternTypingMismatch
-              { errLoc = s
-              , errPat = p
-              , tyExpected = dataConstructorTypeFresh
-              , tyActual = ty
-              }
+      else throw PatternTypingMismatch { errLoc = s , errPat = p , tyExpected = dataConstructorTypeFresh , tyActual = ty }
   where
     unpeel :: [Pattern ()] -- A list of patterns for each part of a data constructor pattern
             -> Type -- The remaining type of the constructor
             -> Checker (Ctxt Assumption, Ctxt Kind, Substitution, [Pattern Type], Consumption)
-    unpeel = unpeel' ([],[],[],[],Full)
+    unpeel pats t = do
+      (ass, kc, sub, ps, c) <- unpeel' ([],[],[],[],Full) pats t
+      pure (ass, kc, sub, reverse ps, c)
 
     -- Tail recursive version of unpeel
     unpeel' acc [] t = return acc

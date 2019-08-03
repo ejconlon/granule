@@ -1,0 +1,4 @@
+interface Simple1 a
+
+-- one of the parent interfaces is not in scope
+interface {Simple1 a, Simple2 a} => Simple3 a

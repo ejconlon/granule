@@ -1,0 +1,6 @@
+data SimpleDT = SDT
+
+interface Simple a
+
+-- 'A' is not in scope
+instance Simple (SimpleDT A)

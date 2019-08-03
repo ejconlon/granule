@@ -1,0 +1,5 @@
+interface Simple1 a
+
+-- one of the interface constraints is not in scope
+simple : forall {a : Type} . {Simple1 a, Simple2 a} => a -> a
+simple x = x

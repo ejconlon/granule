@@ -16,27 +16,32 @@ import Language.Granule.Syntax.Span
 
 import Language.Granule.Utils
 
-compileNatKindedTypeToCoeffect :: (?globals :: Globals) => Span -> Type -> Checker Coeffect
-compileNatKindedTypeToCoeffect s (TyInfix op t1 t2) = do
-  t1' <- compileNatKindedTypeToCoeffect s t1
-  t2' <- compileNatKindedTypeToCoeffect s t2
-  case op of
-    TyOpPlus  -> return $ CPlus t1' t2'
-    TyOpTimes -> return $ CTimes t1' t2'
-    TyOpExpon -> return $ CExpon t1' t2'
-    TyOpMinus -> return $ CMinus t1' t2'
-    TyOpJoin  -> return $ CJoin t1' t2'
-    TyOpMeet  -> return $ CMeet t1' t2'
-    _ -> undefined
 
-compileNatKindedTypeToCoeffect _ (TyInt n) =
-  return $ CNat n
-compileNatKindedTypeToCoeffect _ (TyVar v) =
-  return $ CVar v
-compileNatKindedTypeToCoeffect _ (TyCon (internalName -> "Pure")) =
-  return $ CNat 0
+compileNatKindedTypeToCoeffectSafe :: Type -> Maybe Coeffect
+compileNatKindedTypeToCoeffectSafe (TyInfix op t1 t2) = do
+  t1' <- compileNatKindedTypeToCoeffectSafe t1
+  t2' <- compileNatKindedTypeToCoeffectSafe t2
+  case op of
+    TyOpPlus  -> pure $ CPlus t1' t2'
+    TyOpTimes -> pure $ CTimes t1' t2'
+    TyOpExpon -> pure $ CExpon t1' t2'
+    TyOpMinus -> pure $ CMinus t1' t2'
+    TyOpJoin  -> pure $ CJoin t1' t2'
+    TyOpMeet  -> pure $ CMeet t1' t2'
+    _ -> Nothing
+compileNatKindedTypeToCoeffectSafe (TyInt n) = pure $ CNat n
+compileNatKindedTypeToCoeffectSafe (TyVar v) = pure $ CVar v
+compileNatKindedTypeToCoeffectSafe (TyCon (internalName -> "Pure")) = pure $ CNat 0
+compileNatKindedTypeToCoeffectSafe _ = Nothing
+
+
+compileNatKindedTypeToCoeffect :: (?globals :: Globals) => Span -> Type -> Checker Coeffect
+compileNatKindedTypeToCoeffect s tinfix@(TyInfix op _ _) =
+  maybe (throw NotImplemented{ errLoc = s, errDesc = "I don't know how to compile binary operator " <> pretty op })
+        pure (compileNatKindedTypeToCoeffectSafe tinfix)
 compileNatKindedTypeToCoeffect s t =
-  throw $ KindError{errLoc = s, errTy = t, errK = kNat }
+  maybe (throw KindError{errLoc = s, errTy = t, errK = kNat }) pure (compileNatKindedTypeToCoeffectSafe t)
+
 
 compileTypeConstraintToConstraint ::
     (?globals :: Globals) => Span -> Type -> Checker Pred
@@ -50,7 +55,22 @@ compileTypeConstraintToConstraint s (TyInfix op t1 t2) = do
     TyOpGreater -> return $ Con (Gt s c1 c2)
     TyOpLesserEq -> return $ Con (LtEq s c1 c2)
     TyOpGreaterEq -> return $ Con (GtEq s c1 c2)
-    _ -> error $ pretty s <> ": I don't know how to compile binary operator " <> pretty op
+    _ -> throw NotImplemented{ errLoc = s, errDesc = "I don't know how to compile binary operator " <> pretty op }
 
 compileTypeConstraintToConstraint s t =
-  error $ pretty s <> ": I don't know how to compile a constraint `" <> pretty t <> "`"
+  throw NotImplemented{ errLoc = s, errDesc = "I don't know how to compile a constraint " <> prettyQuoted t }
+
+
+-----------------------
+-- Predicate Helpers --
+-----------------------
+
+
+compileAndAddPredicate :: (?globals :: Globals) => Span -> Type -> Checker ()
+compileAndAddPredicate sp ty =
+  compileTypeConstraintToConstraint sp ty >>= addPredicate
+
+
+-- | Constrain the typescheme with the given predicates.
+constrainTysWithPredicates :: [Type] -> TypeScheme -> TypeScheme
+constrainTysWithPredicates preds (Forall sp binds constrs ty) = Forall sp binds (constrs <> preds) ty

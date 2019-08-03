@@ -21,7 +21,7 @@ data TypeScheme =
   Forall
     Span          -- span of the scheme
     [(Id, Kind)]  -- binders
-    [Type]        -- constraints
+    [TConstraint] -- constraints
     Type          -- type
   deriving (Eq, Show, Generic)
 
@@ -55,13 +55,42 @@ data Type = FunTy Type Type           -- ^ Function type
           | TyInt Int                 -- ^ Type-level Int
           | TyInfix TypeOperator Type Type  -- ^ Infix type operator
           | TySet [Type]              -- ^ Type-level set
+          | TyCoeffect Coeffect       -- ^ Promoted coeffect
     deriving (Eq, Ord, Show)
+
+
+------------------
+-- Type Helpers --
+------------------
+
+
+-- | Get parameters of a type application, as well
+-- | as the type the parameters are applied to.
+-- |
+-- | Returns 'Nothing' if the type does not represent
+-- | a type application.
+tyAppParts :: Type -> Maybe (Type, [Type])
+tyAppParts t@(TyApp c _) = Just (appHead c, appArgs t)
+  where appHead (TyApp h _) = appHead h
+        appHead h = h
+        appArgs TyCon{} = []
+        appArgs (TyApp TyVar{} final) = pure final
+        appArgs (TyApp TyCon{} final) = pure final
+        appArgs (TyApp (TyApp h r) final) = appArgs h <> pure r <> pure final
+        appArgs _ = []
+tyAppParts _ = Nothing
+
+
+type TConstraint = Type
+
+data ConstraintForm = InterfaceC | Predicate
+  deriving (Show, Ord, Eq)
 
 -- | Kinds
 data Kind = KType
           | KCoeffect
           | KEffect
-          | KPredicate
+          | KConstraint ConstraintForm
           | KFun Kind Kind
           | KVar Id              -- Kind poly variable
           | KPromote Type        -- Promoted types
@@ -93,7 +122,7 @@ instance Monad m => Freshenable m Kind where
   freshen KType = return KType
   freshen KCoeffect = return KCoeffect
   freshen KEffect = return KEffect
-  freshen KPredicate = return KPredicate
+  freshen c@(KConstraint _) = return c
   freshen (KFun k1 k2) = do
     k1 <- freshen k1
     k2 <- freshen k2
@@ -331,6 +360,8 @@ mTyInfix :: Monad m => TypeOperator -> Type -> Type -> m Type
 mTyInfix op x y  = return (TyInfix op x y)
 mTySet   :: Monad m => [Type] -> m Type
 mTySet xs = return (TySet xs)
+mTyCoeffect :: Monad m => Coeffect -> m Type
+mTyCoeffect = pure . TyCoeffect
 
 -- Monadic algebra for types
 data TypeFold m a = TypeFold
@@ -342,12 +373,13 @@ data TypeFold m a = TypeFold
   , tfTyApp   :: a -> a        -> m a
   , tfTyInt   :: Int           -> m a
   , tfTyInfix :: TypeOperator  -> a -> a -> m a
-  , tfSet     :: [a]           -> m a }
+  , tfSet     :: [a]           -> m a
+  , tfTyCoeffect :: Coeffect -> m a }
 
 -- Base monadic algebra
 baseTypeFold :: Monad m => TypeFold m Type
 baseTypeFold =
-  TypeFold mFunTy mTyCon mBox mDiamond mTyVar mTyApp mTyInt mTyInfix mTySet
+  TypeFold mFunTy mTyCon mBox mDiamond mTyVar mTyApp mTyInt mTyInfix mTySet mTyCoeffect
 
 -- | Monadic fold on a `Type` value
 typeFoldM :: Monad m => TypeFold m a -> Type -> m a
@@ -378,6 +410,7 @@ typeFoldM algebra = go
    go (TySet ts) = do
     ts' <- mapM go ts
     (tfSet algebra) ts'
+   go (TyCoeffect c) = (tfTyCoeffect algebra) c
 
 instance FirstParameter TypeScheme Span
 
@@ -401,6 +434,7 @@ instance Term Type where
       , tfTyInt   = \_ -> return []
       , tfTyInfix = \_ y z -> return $ y <> z
       , tfSet     = return . concat
+      , tfTyCoeffect = \c -> pure (freeVars c)
       }
 
 instance Term Coeffect where
@@ -437,14 +471,16 @@ instance Freshenable m TypeScheme where
 
 instance Freshenable m Type where
   freshen =
-    typeFoldM (baseTypeFold { tfTyVar = freshenTyVar,
-                              tfBox = freshenTyBox })
+    typeFoldM (baseTypeFold { tfTyVar = freshenTyVar
+                            , tfBox = freshenTyBox
+                            , tfTyCoeffect = freshenTyCoeffect })
     where
 
       freshenTyBox c t = do
         c' <- freshen c
         t' <- freshen t
         return $ Box c' t'
+      freshenTyCoeffect = fmap TyCoeffect . freshen
       freshenTyVar v = do
         v' <- lookupVar Type v
         case v' of
