@@ -6,18 +6,21 @@ module Language.Granule.Syntax.Preprocessor.Ascii
   , asciiUnicodeTableMarkdown
   ) where
 
-import Control.Arrow (first, second)
+import Data.Bifunctor (bimap)
 import Data.String (fromString)
 import Text.Replace (Replace(..), replaceWithList)
+import qualified Data.Text.Lazy as TL
 
+-- TODO(ejconlon) Use Text instead of converting back and forth to strings.
 asciiToUnicode :: String -> String
-asciiToUnicode = replaceWithList $ map (uncurry Replace . first fromString) asciiUnicodeTable
+asciiToUnicode = TL.unpack . replaceWithList (map (uncurry Replace . bimap fromString fromString) asciiUnicodeTable) . TL.pack
 
+-- TODO(ejconlon) Use Text instead of converting back and forth to strings.
 unicodeToAscii :: String -> String
-unicodeToAscii = replaceWithList $ map (uncurry (flip Replace) . second fromString) asciiUnicodeTable
+unicodeToAscii = TL.unpack . replaceWithList (map (uncurry (flip Replace) . bimap fromString fromString) asciiUnicodeTable) . TL.pack
 
 -- NOTE: Update the documentation with 'asciiUnicodeTableMarkdown' if you touch this.
-asciiUnicodeTable :: [(String,String)]
+asciiUnicodeTable :: [(String, String)]
 asciiUnicodeTable =
     [ ("forall" , "∀")
     , ("Inf" , "∞")
